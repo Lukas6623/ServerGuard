@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 
-import subprocess
+import os
 import re
 import json
-import os
 import time
-from collections import defaultdict
-from datetime import datetime, timedelta
+import subprocess
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 
 # ============================================================
-# SERVERGUARD - REALTIME BRUTE FORCE GUARD
+# SERVERGUARD BRUTE FORCE PROTECTION
 # ============================================================
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 
 # ============================================================
@@ -21,67 +21,118 @@ VERSION = "2.2.0"
 # ============================================================
 
 MAX_ATTEMPTS = 10
+
 WINDOW_SECONDS = 10 * 60
+
 CHECK_INTERVAL = 2
 
-# ------------------------------------------------------------
-# SAFETY
-# ------------------------------------------------------------
-# True  = detect only
-# False = real UFW blocking
-DRY_RUN = True
+MAX_SAVED_EVENTS = 200
 
-# Never block these IP addresses
+
+# ------------------------------------------------------------
+# Protection mode
+#
+# Normal manual launch:
+#     DRY_RUN = True
+#
+# systemd:
+#     SERVERGUARD_PROTECTION=1
+#     -> real protection
+# ------------------------------------------------------------
+
+DRY_RUN = (
+    os.getenv(
+        "SERVERGUARD_PROTECTION",
+        "0"
+    ) != "1"
+)
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE_DIR = Path(
+    "/opt/serverguard"
+)
+
+DATA_DIR = (
+    BASE_DIR /
+    "data"
+)
+
+BLOCKED_FILE = (
+    DATA_DIR /
+    "blocked_ips.json"
+)
+
+EVENTS_FILE = (
+    DATA_DIR /
+    "events.json"
+)
+
+
+# ============================================================
+# WHITELIST
+# ============================================================
+
 WHITELIST = {
     "127.0.0.1",
-    "::1",
+    "::1"
 }
 
 
 # ============================================================
-# STORAGE LIMITS
+# REGEX
 # ============================================================
 
-DATA_DIR = "data"
-
-BLOCKED_FILE = os.path.join(
-    DATA_DIR,
-    "blocked_ips.json"
+FAILED_PASSWORD_INVALID_RE = re.compile(
+    r"Failed password for invalid user "
+    r"(\S+) from "
+    r"([0-9a-fA-F:.]+)"
 )
 
-EVENTS_FILE = os.path.join(
-    DATA_DIR,
-    "events.json"
+FAILED_PASSWORD_RE = re.compile(
+    r"Failed password for "
+    r"(\S+) from "
+    r"([0-9a-fA-F:.]+)"
 )
 
-# Maximum number of important events saved to disk.
-MAX_SAVED_EVENTS = 200
+INVALID_USER_RE = re.compile(
+    r"Invalid user "
+    r"(\S+) from "
+    r"([0-9a-fA-F:.]+)"
+)
+
+FAILED_PUBLICKEY_RE = re.compile(
+    r"Failed publickey for "
+    r"(?:invalid user )?"
+    r"(\S+) from "
+    r"([0-9a-fA-F:.]+)"
+)
 
 
 # ============================================================
-# MEMORY
+# RUNTIME STATE
 # ============================================================
 
-# IP -> list of recent SSH events
-recent_events = defaultdict(list)
+recent_events = []
 
-# IPs that were REALLY blocked
 blocked_ips = set()
 
-# Used to prevent the same event from being processed twice
-recent_event_keys = set()
+handled_ips = set()
+
+seen_events = set()
 
 
 # ============================================================
-# COLORS
+# TIME
 # ============================================================
 
-RED = "\033[91m"
-YELLOW = "\033[93m"
-GREEN = "\033[92m"
-CYAN = "\033[96m"
-GRAY = "\033[90m"
-RESET = "\033[0m"
+def now_utc():
+    return datetime.now(
+        timezone.utc
+    )
 
 
 # ============================================================
@@ -89,11 +140,23 @@ RESET = "\033[0m"
 # ============================================================
 
 def ensure_data_directory():
-    os.makedirs(DATA_DIR, exist_ok=True)
+
+    try:
+
+        DATA_DIR.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+    except Exception as error:
+
+        print(
+            f"[!] Cannot create data directory: {error}"
+        )
 
 
 # ============================================================
-# BLOCKED IP STORAGE
+# LOAD BLOCKED IPS
 # ============================================================
 
 def load_blocked_ips():
@@ -102,9 +165,12 @@ def load_blocked_ips():
 
     ensure_data_directory()
 
-    if not os.path.exists(BLOCKED_FILE):
+    if not BLOCKED_FILE.exists():
+
         blocked_ips = set()
+
         return
+
 
     try:
 
@@ -116,29 +182,49 @@ def load_blocked_ips():
 
             data = json.load(file)
 
+
         if isinstance(data, list):
-            blocked_ips = set(data)
+
+            blocked_ips = {
+                str(ip).strip()
+                for ip in data
+                if str(ip).strip()
+            }
+
         else:
+
             blocked_ips = set()
+
 
     except Exception as error:
 
         print(
-            f"{YELLOW}[WARNING] "
-            f"Could not read {BLOCKED_FILE}: "
-            f"{error}{RESET}"
+            f"[!] Cannot load blocked IPs: {error}"
         )
 
         blocked_ips = set()
 
 
+# ============================================================
+# SAVE BLOCKED IPS
+# ============================================================
+
 def save_blocked_ips():
 
     ensure_data_directory()
 
-    temporary_file = BLOCKED_FILE + ".tmp"
+    temporary_file = (
+        BLOCKED_FILE.with_suffix(
+            ".tmp"
+        )
+    )
 
     try:
+
+        data = sorted(
+            blocked_ips
+        )
+
 
         with open(
             temporary_file,
@@ -147,38 +233,46 @@ def save_blocked_ips():
         ) as file:
 
             json.dump(
-                sorted(blocked_ips),
+                data,
                 file,
-                indent=2
+                indent=2,
+                ensure_ascii=False
             )
+
 
         os.replace(
             temporary_file,
             BLOCKED_FILE
         )
 
+
     except Exception as error:
 
         print(
-            f"{RED}[ERROR] "
-            f"Could not save blocked IPs: "
-            f"{error}{RESET}"
+            f"[!] Cannot save blocked IPs: {error}"
         )
 
-        if os.path.exists(temporary_file):
-            os.remove(temporary_file)
+        try:
+
+            if temporary_file.exists():
+                temporary_file.unlink()
+
+        except Exception:
+            pass
 
 
 # ============================================================
-# EVENT LOG
+# LOAD EVENTS
 # ============================================================
 
 def load_events():
 
     ensure_data_directory()
 
-    if not os.path.exists(EVENTS_FILE):
-        return []
+    if not EVENTS_FILE.exists():
+
+        return
+
 
     try:
 
@@ -190,50 +284,75 @@ def load_events():
 
             data = json.load(file)
 
-        if isinstance(data, list):
-            return data
+
+        if not isinstance(
+            data,
+            list
+        ):
+            return
+
+
+        # ----------------------------------------------------
+        # We do not need old events in runtime.
+        # They are only historical records.
+        # ----------------------------------------------------
 
     except Exception:
         pass
 
-    return []
+
+# ============================================================
+# SAVE IMPORTANT EVENT
+# ============================================================
+
+def save_event(event):
+
+    ensure_data_directory()
+
+    events = []
 
 
-def save_event(
-    ip,
-    attempts,
-    users,
-    event_types,
-    action,
-    risk
-):
-    """
-    Save ONLY important events.
+    if EVENTS_FILE.exists():
 
-    This function is never called for every SSH attempt.
-    """
+        try:
 
-    events = load_events()
+            with open(
+                EVENTS_FILE,
+                "r",
+                encoding="utf-8"
+            ) as file:
 
-    event = {
-        "time": datetime.now().isoformat(
-            timespec="seconds"
-        ),
-        "ip": ip,
-        "attempts": attempts,
-        "users": users,
-        "types": event_types,
-        "action": action,
-        "risk": risk
-    }
+                data = json.load(file)
 
-    events.append(event)
+                if isinstance(
+                    data,
+                    list
+                ):
+                    events = data
 
-    # Keep only the newest events.
+        except Exception:
+
+            events = []
+
+
+    events.append(
+        event
+    )
+
+
     if len(events) > MAX_SAVED_EVENTS:
-        events = events[-MAX_SAVED_EVENTS:]
 
-    temporary_file = EVENTS_FILE + ".tmp"
+        events = events[
+            -MAX_SAVED_EVENTS:
+        ]
+
+
+    temporary_file = (
+        EVENTS_FILE.with_suffix(
+            ".tmp"
+        )
+    )
+
 
     try:
 
@@ -246,28 +365,34 @@ def save_event(
             json.dump(
                 events,
                 file,
-                indent=2
+                indent=2,
+                ensure_ascii=False
             )
+
 
         os.replace(
             temporary_file,
             EVENTS_FILE
         )
 
+
     except Exception as error:
 
         print(
-            f"{YELLOW}[WARNING] "
-            f"Could not save security event: "
-            f"{error}{RESET}"
+            f"[!] Cannot save security event: {error}"
         )
 
-        if os.path.exists(temporary_file):
-            os.remove(temporary_file)
+        try:
+
+            if temporary_file.exists():
+                temporary_file.unlink()
+
+        except Exception:
+            pass
 
 
 # ============================================================
-# UFW
+# CHECK UFW
 # ============================================================
 
 def check_ufw():
@@ -280,154 +405,217 @@ def check_ufw():
                 "status"
             ],
             capture_output=True,
-            text=True
+            text=True,
+            timeout=10
         )
 
-        output = result.stdout.lower()
 
-        return "status: active" in output
+        output = (
+            result.stdout +
+            "\n" +
+            result.stderr
+        )
 
-    except FileNotFoundError:
+
+        if "Status: active" in output:
+
+            return True
+
 
         return False
 
-    except Exception:
-
-        return False
-
-
-def block_ip(ip):
-
-    if ip in WHITELIST:
-
-        print(
-            f"{YELLOW}[WHITELIST] "
-            f"Skipping {ip}{RESET}"
-        )
-
-        return False
-
-    if ip in blocked_ips:
-
-        print(
-            f"{CYAN}[ALREADY BLOCKED] "
-            f"{ip}{RESET}"
-        )
-
-        return False
-
-    command = [
-        "ufw",
-        "insert",
-        "1",
-        "deny",
-        "from",
-        ip
-    ]
-
-    # ========================================================
-    # DRY RUN
-    # ========================================================
-
-    if DRY_RUN:
-
-        print()
-        print(
-            f"{YELLOW}[DRY-RUN] "
-            f"Would BLOCK: {ip}{RESET}"
-        )
-
-        print(
-            f"{YELLOW}[DRY-RUN] "
-            f"ufw insert 1 deny from {ip}{RESET}"
-        )
-
-        # VERY IMPORTANT:
-        #
-        # We DO NOT:
-        #   - add IP to blocked_ips
-        #   - save blocked_ips.json
-        #
-        # because this is only simulation.
-
-        return False
-
-    # ========================================================
-    # REAL PROTECTION
-    # ========================================================
-
-    print()
-    print(
-        f"{RED}[BLOCKING] {ip}{RESET}"
-    )
-
-    try:
-
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True
-        )
-
-    except FileNotFoundError:
-
-        print(
-            f"{RED}[ERROR] "
-            f"UFW is not installed.{RESET}"
-        )
-
-        return False
 
     except Exception as error:
 
         print(
-            f"{RED}[ERROR] "
-            f"UFW execution failed: "
-            f"{error}{RESET}"
+            f"[!] Cannot check UFW: {error}"
         )
 
         return False
 
-    # ========================================================
-    # SUCCESS
-    # ========================================================
 
-    if result.returncode == 0:
+# ============================================================
+# VALIDATE IP
+# ============================================================
 
-        blocked_ips.add(ip)
+def is_valid_ip(ip):
 
-        save_blocked_ips()
+    # --------------------------------------------------------
+    # IPv4
+    # --------------------------------------------------------
 
-        print(
-            f"{GREEN}[BLOCKED] "
-            f"{ip}{RESET}"
-        )
-
-        return True
-
-    # ========================================================
-    # FAILURE
-    # ========================================================
-
-    print(
-        f"{RED}[ERROR] "
-        f"Failed to block {ip}{RESET}"
+    ipv4 = re.match(
+        r"^(?:\d{1,3}\.){3}\d{1,3}$",
+        ip
     )
 
-    if result.stderr.strip():
 
-        print(
-            f"{RED}{result.stderr.strip()}{RESET}"
+    if ipv4:
+
+        try:
+
+            parts = [
+                int(x)
+                for x in ip.split(".")
+            ]
+
+            return all(
+                0 <= x <= 255
+                for x in parts
+            )
+
+        except Exception:
+
+            return False
+
+
+    # --------------------------------------------------------
+    # IPv6
+    # --------------------------------------------------------
+
+    if ":" in ip:
+
+        # Basic IPv6 validation.
+        # SSH logs give us an already parsed address.
+        return bool(
+            re.match(
+                r"^[0-9a-fA-F:]+$",
+                ip
+            )
         )
+
 
     return False
 
 
 # ============================================================
-# SSH JOURNAL
+# PARSE SSH EVENT
 # ============================================================
 
-def get_ssh_logs():
+def parse_ssh_event(line):
+
+    if not line:
+        return None
+
+
+    # --------------------------------------------------------
+    # Ignore generic authentication failure.
+    #
+    # OpenSSH may produce another log entry for the same
+    # failed authentication. Counting it would double-count.
+    # --------------------------------------------------------
+
+    if "authentication failure" in line.lower():
+
+        return None
+
+
+    # --------------------------------------------------------
+    # Failed password for invalid user
+    # --------------------------------------------------------
+
+    match = FAILED_PASSWORD_INVALID_RE.search(
+        line
+    )
+
+    if match:
+
+        username = match.group(1)
+
+        ip = match.group(2)
+
+        return {
+            "ip": ip,
+            "username": username,
+            "type": "failed_password"
+        }
+
+
+    # --------------------------------------------------------
+    # Failed password
+    # --------------------------------------------------------
+
+    match = FAILED_PASSWORD_RE.search(
+        line
+    )
+
+    if match:
+
+        username = match.group(1)
+
+        ip = match.group(2)
+
+        return {
+            "ip": ip,
+            "username": username,
+            "type": "failed_password"
+        }
+
+
+    # --------------------------------------------------------
+    # Invalid user
+    # --------------------------------------------------------
+
+    match = INVALID_USER_RE.search(
+        line
+    )
+
+    if match:
+
+        username = match.group(1)
+
+        ip = match.group(2)
+
+        return {
+            "ip": ip,
+            "username": username,
+            "type": "invalid_user"
+        }
+
+
+    # --------------------------------------------------------
+    # Failed public key
+    # --------------------------------------------------------
+
+    match = FAILED_PUBLICKEY_RE.search(
+        line
+    )
+
+    if match:
+
+        username = match.group(1)
+
+        ip = match.group(2)
+
+        return {
+            "ip": ip,
+            "username": username,
+            "type": "failed_publickey"
+        }
+
+
+    return None
+
+
+# ============================================================
+# EVENT ID
+# ============================================================
+
+def make_event_id(line):
+
+    # --------------------------------------------------------
+    # We use the complete journal line as a temporary
+    # duplicate protection key.
+    # --------------------------------------------------------
+
+    return line.strip()
+
+
+# ============================================================
+# READ NEW SSH LOGS
+# ============================================================
+
+def read_new_ssh_logs():
 
     commands = [
 
@@ -455,6 +643,7 @@ def get_ssh_logs():
 
     ]
 
+
     for command in commands:
 
         try:
@@ -462,467 +651,750 @@ def get_ssh_logs():
             result = subprocess.run(
                 command,
                 capture_output=True,
-                text=True
+                text=True,
+                timeout=10
             )
 
-            if (
-                result.returncode == 0
-                and result.stdout.strip()
-            ):
 
-                return result.stdout.splitlines()
+            if result.returncode != 0:
+
+                continue
+
+
+            output = result.stdout.strip()
+
+
+            if output:
+
+                return output.splitlines()
+
 
         except Exception:
 
             continue
 
+
+    # --------------------------------------------------------
+    # Fallback to auth.log
+    # --------------------------------------------------------
+
+    auth_log = Path(
+        "/var/log/auth.log"
+    )
+
+
+    if auth_log.exists():
+
+        try:
+
+            result = subprocess.run(
+                [
+                    "tail",
+                    "-n",
+                    "100",
+                    str(auth_log)
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+
+            if result.returncode == 0:
+
+                return result.stdout.splitlines()
+
+
+        except Exception:
+
+            pass
+
+
     return []
 
 
 # ============================================================
-# SSH EVENT PARSER
+# REMOVE OLD EVENTS
 # ============================================================
 
-def parse_ssh_event(line):
+def cleanup_old_events():
 
-    # --------------------------------------------------------
-    # Failed password for invalid user
-    # --------------------------------------------------------
+    current_time = time.time()
 
-    match = re.search(
-        r"Failed password for invalid user "
-        r"(\S+) from "
-        r"(\d+\.\d+\.\d+\.\d+)",
-        line
+
+    minimum_time = (
+        current_time -
+        WINDOW_SECONDS
     )
 
-    if match:
 
-        return {
-            "ip": match.group(2),
-            "username": match.group(1),
-            "type": "failed_password"
-        }
+    global recent_events
 
-    # --------------------------------------------------------
-    # Failed password
-    # --------------------------------------------------------
-
-    match = re.search(
-        r"Failed password for "
-        r"(\S+) from "
-        r"(\d+\.\d+\.\d+\.\d+)",
-        line
-    )
-
-    if match:
-
-        return {
-            "ip": match.group(2),
-            "username": match.group(1),
-            "type": "failed_password"
-        }
-
-    # --------------------------------------------------------
-    # Invalid user
-    # --------------------------------------------------------
-
-    match = re.search(
-        r"Invalid user "
-        r"(\S+) from "
-        r"(\d+\.\d+\.\d+\.\d+)",
-        line
-    )
-
-    if match:
-
-        return {
-            "ip": match.group(2),
-            "username": match.group(1),
-            "type": "invalid_user"
-        }
-
-    # --------------------------------------------------------
-    # Failed public key
-    # --------------------------------------------------------
-
-    match = re.search(
-        r"Failed publickey for "
-        r"(\S+) from "
-        r"(\d+\.\d+\.\d+\.\d+)",
-        line
-    )
-
-    if match:
-
-        return {
-            "ip": match.group(2),
-            "username": match.group(1),
-            "type": "failed_publickey"
-        }
-
-    # --------------------------------------------------------
-    # Ignore generic PAM authentication failure
-    # --------------------------------------------------------
-
-    if "authentication failure" in line:
-
-        return None
-
-    return None
+    recent_events = [
+        event
+        for event in recent_events
+        if event["timestamp"] >= minimum_time
+    ]
 
 
 # ============================================================
-# EVENT DEDUPLICATION
+# ADD EVENT
 # ============================================================
 
-def make_event_key(
+def add_event(
     ip,
     username,
     event_type
 ):
-    """
-    Creates a short in-memory key.
 
-    No data is written to disk.
-    """
+    current_time = time.time()
 
-    return (
+
+    recent_events.append(
+        {
+            "timestamp": current_time,
+            "ip": ip,
+            "username": username,
+            "type": event_type
+        }
+    )
+
+
+# ============================================================
+# GET IP EVENTS
+# ============================================================
+
+def get_ip_events(ip):
+
+    cleanup_old_events()
+
+
+    return [
+        event
+        for event in recent_events
+        if event["ip"] == ip
+    ]
+
+
+# ============================================================
+# RISK
+# ============================================================
+
+def calculate_risk(
+    attempts
+):
+
+    if attempts >= 50:
+
+        return "CRITICAL"
+
+
+    if attempts >= 20:
+
+        return "HIGH"
+
+
+    if attempts >= 10:
+
+        return "MEDIUM"
+
+
+    if attempts >= 5:
+
+        return "LOW"
+
+
+    return "LOW"
+
+
+# ============================================================
+# DISPLAY THREAT
+# ============================================================
+
+def show_threat(
+    ip,
+    events
+):
+
+    attempts = len(
+        events
+    )
+
+
+    users = sorted(
+        {
+            event["username"]
+            for event in events
+            if event.get("username")
+        }
+    )
+
+
+    event_types = sorted(
+        {
+            event["type"]
+            for event in events
+        }
+    )
+
+
+    risk = calculate_risk(
+        attempts
+    )
+
+
+    print()
+
+    print(
+        "============================================================"
+    )
+
+    print(
+        "[THREAT DETECTED]"
+    )
+
+    print(
+        f"IP:       {ip}"
+    )
+
+    print(
+        f"Attempts: {attempts}"
+    )
+
+    print(
+        "Users:    "
+        + (
+            ", ".join(users)
+            if users
+            else "unknown"
+        )
+    )
+
+    print(
+        "Types:    "
+        + (
+            ", ".join(event_types)
+            if event_types
+            else "unknown"
+        )
+    )
+
+    print(
+        "Window:   10 minutes"
+    )
+
+    print(
+        f"Risk:     {risk}"
+    )
+
+    print(
+        "============================================================"
+    )
+
+
+# ============================================================
+# BLOCK IP
+# ============================================================
+
+def block_ip(ip):
+
+    if ip in WHITELIST:
+
+        print(
+            f"[!] BLOCK SKIPPED: {ip} is whitelisted."
+        )
+
+        return False
+
+
+    if not is_valid_ip(ip):
+
+        print(
+            f"[!] BLOCK SKIPPED: invalid IP: {ip}"
+        )
+
+        return False
+
+
+    if ip in blocked_ips:
+
+        return True
+
+
+    # --------------------------------------------------------
+    # DRY RUN
+    # --------------------------------------------------------
+
+    if DRY_RUN:
+
+        print(
+            f"[DRY-RUN] Would BLOCK: {ip}"
+        )
+
+        print(
+            "[DRY-RUN] No files modified."
+        )
+
+        return False
+
+
+    # --------------------------------------------------------
+    # UFW check
+    # --------------------------------------------------------
+
+    if not check_ufw():
+
+        print(
+            "[!] UFW is not active."
+        )
+
+        print(
+            f"[!] Cannot block {ip}."
+        )
+
+        return False
+
+
+    # --------------------------------------------------------
+    # UFW block
+    # --------------------------------------------------------
+
+    print(
+        f"[*] Blocking IP: {ip}"
+    )
+
+
+    try:
+
+        result = subprocess.run(
+            [
+                "ufw",
+                "insert",
+                "1",
+                "deny",
+                "from",
+                ip
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+
+
+    except Exception as error:
+
+        print(
+            f"[!] UFW command failed: {error}"
+        )
+
+        return False
+
+
+    # --------------------------------------------------------
+    # Check result
+    # --------------------------------------------------------
+
+    if result.returncode != 0:
+
+        output = (
+            result.stdout +
+            "\n" +
+            result.stderr
+        ).strip()
+
+
+        print(
+            "[!] Failed to block IP."
+        )
+
+
+        if output:
+
+            print(
+                f"    {output}"
+            )
+
+
+        return False
+
+
+    # --------------------------------------------------------
+    # Successful block
+    # --------------------------------------------------------
+
+    blocked_ips.add(
+        ip
+    )
+
+
+    handled_ips.add(
+        ip
+    )
+
+
+    save_blocked_ips()
+
+
+    print(
+        f"[+] BLOCKED: {ip}"
+    )
+
+
+    return True
+
+
+# ============================================================
+# SAVE THREAT EVENT
+# ============================================================
+
+def save_threat_event(
+    ip,
+    events,
+    blocked
+):
+
+    users = sorted(
+        {
+            event["username"]
+            for event in events
+            if event.get("username")
+        }
+    )
+
+
+    event_types = sorted(
+        {
+            event["type"]
+            for event in events
+        }
+    )
+
+
+    event = {
+        "timestamp": now_utc().isoformat(),
+        "ip": ip,
+        "attempts": len(events),
+        "users": users,
+        "types": event_types,
+        "window_seconds": WINDOW_SECONDS,
+        "risk": calculate_risk(
+            len(events)
+        ),
+        "action": (
+            "blocked"
+            if blocked
+            else "detected"
+        ),
+        "dry_run": DRY_RUN
+    }
+
+
+    save_event(
+        event
+    )
+
+
+# ============================================================
+# HANDLE ATTACK
+# ============================================================
+
+def handle_attack(
+    ip
+):
+
+    # --------------------------------------------------------
+    # Already blocked
+    # --------------------------------------------------------
+
+    if ip in blocked_ips:
+
+        handled_ips.add(
+            ip
+        )
+
+        return
+
+
+    # --------------------------------------------------------
+    # Already handled during this runtime
+    # --------------------------------------------------------
+
+    if ip in handled_ips:
+
+        return
+
+
+    events = get_ip_events(
+        ip
+    )
+
+
+    if len(events) < MAX_ATTEMPTS:
+
+        return
+
+
+    # --------------------------------------------------------
+    # Threat
+    # --------------------------------------------------------
+
+    show_threat(
+        ip,
+        events
+    )
+
+
+    # --------------------------------------------------------
+    # Real protection
+    # --------------------------------------------------------
+
+    if DRY_RUN:
+
+        print(
+            f"[DRY-RUN] Would BLOCK: {ip}"
+        )
+
+        print(
+            "[DRY-RUN] Protection is not modifying the server."
+        )
+
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # We mark the IP as handled even in DRY-RUN.
+        #
+        # This prevents the same IP from producing the same
+        # threat message every 2 seconds.
+        #
+        # It is NOT written to blocked_ips.json.
+        # ----------------------------------------------------
+
+        handled_ips.add(
+            ip
+        )
+
+
+        save_threat_event(
+            ip,
+            events,
+            False
+        )
+
+
+        return
+
+
+    # --------------------------------------------------------
+    # Real block
+    # --------------------------------------------------------
+
+    blocked = block_ip(
+        ip
+    )
+
+
+    if blocked:
+
+        save_threat_event(
+            ip,
+            events,
+            True
+        )
+
+    else:
+
+        # ----------------------------------------------------
+        # If UFW failed, don't spam every 2 seconds forever.
+        #
+        # We remember that this threat was processed for this
+        # runtime. On restart it will be checked again.
+        # ----------------------------------------------------
+
+        handled_ips.add(
+            ip
+        )
+
+
+        save_threat_event(
+            ip,
+            events,
+            False
+        )
+
+
+# ============================================================
+# PROCESS LOG LINE
+# ============================================================
+
+def process_log_line(
+    line
+):
+
+    if not line:
+        return
+
+
+    event_id = make_event_id(
+        line
+    )
+
+
+    if event_id in seen_events:
+
+        return
+
+
+    seen_events.add(
+        event_id
+    )
+
+
+    # --------------------------------------------------------
+    # Prevent unlimited memory growth.
+    # --------------------------------------------------------
+
+    if len(seen_events) > 5000:
+
+        # Keep only the newest part.
+        # Sets are unordered, therefore simply clearing is
+        # acceptable because journal --since only returns
+        # recent entries.
+        seen_events.clear()
+
+
+    event = parse_ssh_event(
+        line
+    )
+
+
+    if not event:
+
+        return
+
+
+    ip = event["ip"]
+
+    username = event["username"]
+
+    event_type = event["type"]
+
+
+    # --------------------------------------------------------
+    # Ignore localhost
+    # --------------------------------------------------------
+
+    if ip in WHITELIST:
+
+        return
+
+
+    # --------------------------------------------------------
+    # Ignore already blocked IPs
+    # --------------------------------------------------------
+
+    if ip in blocked_ips:
+
+        return
+
+
+    # --------------------------------------------------------
+    # Add to memory
+    # --------------------------------------------------------
+
+    add_event(
         ip,
         username,
         event_type
     )
 
 
-# ============================================================
-# CLEAN OLD EVENTS
-# ============================================================
+    # --------------------------------------------------------
+    # Check attack
+    # --------------------------------------------------------
 
-def cleanup_events():
-
-    cutoff = (
-        datetime.now()
-        - timedelta(
-            seconds=WINDOW_SECONDS
-        )
+    handle_attack(
+        ip
     )
 
-    for ip in list(recent_events.keys()):
-
-        recent_events[ip] = [
-            event
-            for event in recent_events[ip]
-            if event["time"] >= cutoff
-        ]
-
-        if not recent_events[ip]:
-
-            del recent_events[ip]
-
-    # --------------------------------------------------------
-    # Keep deduplication memory small.
-    # --------------------------------------------------------
-
-    if len(recent_event_keys) > 5000:
-
-        recent_event_keys.clear()
-
 
 # ============================================================
-# RISK LEVEL
+# STARTUP INFORMATION
 # ============================================================
 
-def get_risk(attempts):
-
-    if attempts >= 50:
-        return "CRITICAL"
-
-    if attempts >= 20:
-        return "HIGH"
-
-    if attempts >= 5:
-        return "MEDIUM"
-
-    return "LOW"
-
-
-# ============================================================
-# PROCESS NEW SSH EVENTS
-# ============================================================
-
-def process_logs():
-
-    lines = get_ssh_logs()
-
-    if not lines:
-        return
-
-    now = datetime.now()
-
-    for line in lines:
-
-        event = parse_ssh_event(line)
-
-        if not event:
-            continue
-
-        ip = event["ip"]
-        username = event["username"]
-        event_type = event["type"]
-
-        # ----------------------------------------------------
-        # Ignore whitelist
-        # ----------------------------------------------------
-
-        if ip in WHITELIST:
-            continue
-
-        # ----------------------------------------------------
-        # Ignore already blocked
-        # ----------------------------------------------------
-
-        if ip in blocked_ips:
-            continue
-
-        # ----------------------------------------------------
-        # Deduplication
-        # ----------------------------------------------------
-
-        event_key = make_event_key(
-            ip,
-            username,
-            event_type
-        )
-
-        # We don't want the same journal entry to be counted
-        # several times because journalctl windows overlap.
-        #
-        # The key is kept only in RAM.
-
-        if event_key in recent_event_keys:
-
-            # Don't immediately ignore forever.
-            # The key will be cleared during cleanup.
-            continue
-
-        recent_event_keys.add(event_key)
-
-        # ----------------------------------------------------
-        # Store event in RAM only
-        # ----------------------------------------------------
-
-        recent_events[ip].append(
-            {
-                "username": username,
-                "type": event_type,
-                "time": now
-            }
-        )
-
-
-# ============================================================
-# THREAT ANALYSIS
-# ============================================================
-
-def check_threats():
-
-    cleanup_events()
-
-    for ip, events in list(
-        recent_events.items()
-    ):
-
-        if ip in WHITELIST:
-            continue
-
-        if ip in blocked_ips:
-            continue
-
-        attempts = len(events)
-
-        if attempts < MAX_ATTEMPTS:
-            continue
-
-        # ----------------------------------------------------
-        # Users
-        # ----------------------------------------------------
-
-        users = sorted(
-            set(
-                event["username"]
-                for event in events
-            )
-        )
-
-        # ----------------------------------------------------
-        # Event types
-        # ----------------------------------------------------
-
-        event_types = sorted(
-            set(
-                event["type"]
-                for event in events
-            )
-        )
-
-        risk = get_risk(attempts)
-
-        # ----------------------------------------------------
-        # Display threat
-        # ----------------------------------------------------
-
-        print()
-        print("=" * 60)
-
-        print(
-            f"{RED}[THREAT DETECTED]{RESET}"
-        )
-
-        print(
-            f"IP:       {ip}"
-        )
-
-        print(
-            f"Attempts: {attempts}"
-        )
-
-        if len(users) <= 8:
-
-            print(
-                f"Users:    "
-                f"{', '.join(users)}"
-            )
-
-        else:
-
-            print(
-                f"Users:    "
-                f"{', '.join(users[:8])} "
-                f"... +{len(users) - 8}"
-            )
-
-        print(
-            f"Types:    "
-            f"{', '.join(event_types)}"
-        )
-
-        print(
-            f"Window:   "
-            f"{WINDOW_SECONDS // 60} minutes"
-        )
-
-        print(
-            f"Risk:     {risk}"
-        )
-
-        print("=" * 60)
-
-        # ====================================================
-        # DRY RUN
-        # ====================================================
-
-        if DRY_RUN:
-
-            print(
-                f"{YELLOW}"
-                f"[DRY-RUN] Would BLOCK: {ip}"
-                f"{RESET}"
-            )
-
-            print(
-                f"{GRAY}"
-                f"[DRY-RUN] "
-                f"No files modified."
-                f"{RESET}"
-            )
-
-            # ------------------------------------------------
-            # IMPORTANT:
-            #
-            # We do NOT save this event repeatedly.
-            # The same attacker will remain in RAM.
-            # ------------------------------------------------
-
-            continue
-
-        # ====================================================
-        # REAL BLOCK
-        # ====================================================
-
-        blocked = block_ip(ip)
-
-        if blocked:
-
-            # Save ONLY the important security event.
-            save_event(
-                ip=ip,
-                attempts=attempts,
-                users=users,
-                event_types=event_types,
-                action="blocked",
-                risk=risk
-            )
-
-            # Remove from RAM.
-            recent_events.pop(
-                ip,
-                None
-            )
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-def print_banner():
+def print_startup():
 
     print()
-    print("SERVERGUARD")
-    print("===========")
-    print()
-    print("REALTIME BRUTE FORCE GUARD")
-    print("---------------------------")
+
+    print(
+        "============================================================"
+    )
+
+    print(
+        "SERVERGUARD BRUTE FORCE PROTECTION"
+    )
+
     print(
         f"Version: {VERSION}"
     )
 
     print(
-        f"Threshold: "
-        f"{MAX_ATTEMPTS} attempts / "
-        f"{WINDOW_SECONDS // 60} minutes"
+        "============================================================"
+    )
+
+    print()
+
+
+    print(
+        f"Maximum attempts: {MAX_ATTEMPTS}"
     )
 
     print(
-        f"Check interval: "
-        f"{CHECK_INTERVAL}s"
+        "Detection window: 10 minutes"
     )
+
+    print(
+        f"Check interval:   {CHECK_INTERVAL} seconds"
+    )
+
+    print()
+
 
     if DRY_RUN:
 
         print(
-            f"Mode: "
-            f"{YELLOW}DRY-RUN{RESET}"
+            "MODE: DRY-RUN"
+        )
+
+        print(
+            "No IPs will be blocked."
         )
 
     else:
 
         print(
-            f"Mode: "
-            f"{RED}PROTECTION ACTIVE{RESET}"
+            "MODE: ACTIVE PROTECTION"
         )
 
-    print(
-        f"Loaded blocked IPs: "
-        f"{len(blocked_ips)}"
-    )
+        print(
+            "Threatening IPs will be blocked by UFW."
+        )
 
-    print(
-        f"Event history limit: "
-        f"{MAX_SAVED_EVENTS}"
-    )
 
     print()
 
+
+    print(
+        f"Blocked IPs: {len(blocked_ips)}"
+    )
+
+
+    print()
+
+
+# ============================================================
+# STARTUP UFW CHECK
+# ============================================================
 
 def startup_checks():
 
@@ -930,41 +1402,143 @@ def startup_checks():
 
         return True
 
+
     print(
-        f"{YELLOW}"
-        "[SAFETY CHECK] Checking UFW..."
-        f"{RESET}"
+        "[*] Checking UFW..."
     )
+
 
     if not check_ufw():
 
         print()
 
         print(
-            f"{RED}"
-            "WARNING: UFW is not active!"
-            f"{RESET}"
+            "[!] SECURITY ERROR"
         )
 
         print(
-            "ServerGuard will NOT enable UFW automatically."
+            "[!] UFW is inactive."
         )
 
         print(
-            "Configure SSH access first."
+            "[!] Active protection cannot start."
+        )
+
+        print(
+            "[!] Enable/configure UFW first."
         )
 
         print()
 
         return False
 
+
     print(
-        f"{GREEN}"
-        "UFW is active."
-        f"{RESET}"
+        "[+] UFW is active."
     )
 
+    print()
+
+
     return True
+
+
+# ============================================================
+# IGNORE OLD LOGS
+# ============================================================
+
+def warmup_logs():
+
+    print(
+        "[*] Reading current SSH journal..."
+    )
+
+
+    lines = read_new_ssh_logs()
+
+
+    # --------------------------------------------------------
+    # We deliberately DO NOT process old logs on startup.
+    #
+    # Otherwise the server could immediately block IPs based
+    # on attacks that happened before ServerGuard started.
+    # --------------------------------------------------------
+
+    print(
+        f"[*] Existing SSH log entries ignored: {len(lines)}"
+    )
+
+    print()
+
+
+# ============================================================
+# MAIN MONITOR LOOP
+# ============================================================
+
+def monitor():
+
+    print(
+        "Monitoring NEW SSH attacks..."
+    )
+
+    print(
+        "Press Ctrl+C to stop."
+    )
+
+    print()
+
+
+    while True:
+
+        try:
+
+            lines = read_new_ssh_logs()
+
+
+            for line in lines:
+
+                process_log_line(
+                    line
+                )
+
+
+            cleanup_old_events()
+
+
+            time.sleep(
+                CHECK_INTERVAL
+            )
+
+
+        except KeyboardInterrupt:
+
+            print()
+
+            print(
+                "[*] ServerGuard protection stopped."
+            )
+
+            break
+
+
+        except Exception as error:
+
+            print()
+
+            print(
+                f"[!] Monitor error: {error}"
+            )
+
+            print(
+                "[*] Restarting monitor..."
+            )
+
+            print()
+
+
+            time.sleep(
+                CHECK_INTERVAL
+            )
 
 
 # ============================================================
@@ -977,72 +1551,24 @@ def main():
 
     load_blocked_ips()
 
-    print_banner()
+    load_events()
 
-    # --------------------------------------------------------
-    # Establish baseline.
-    #
-    # Old SSH events are ignored.
-    # --------------------------------------------------------
 
-    get_ssh_logs()
+    print_startup()
 
-    print(
-        "Existing SSH logs ignored."
-    )
-
-    print()
-    print(
-        "Monitoring NEW SSH attacks..."
-    )
-
-    print(
-        "Press Ctrl+C to stop."
-    )
-
-    print()
-
-    # --------------------------------------------------------
-    # Safety check
-    # --------------------------------------------------------
 
     if not startup_checks():
 
-        if not DRY_RUN:
+        return 1
 
-            print(
-                f"{YELLOW}"
-                "Protection NOT started."
-                f"{RESET}"
-            )
 
-            return
+    warmup_logs()
 
-    # --------------------------------------------------------
-    # Main loop
-    # --------------------------------------------------------
 
-    try:
+    monitor()
 
-        while True:
 
-            process_logs()
-
-            check_threats()
-
-            time.sleep(
-                CHECK_INTERVAL
-            )
-
-    except KeyboardInterrupt:
-
-        print()
-
-        print(
-            "ServerGuard stopped."
-        )
-
-        print()
+    return 0
 
 
 # ============================================================
@@ -1051,4 +1577,6 @@ def main():
 
 if __name__ == "__main__":
 
-    main()
+    raise SystemExit(
+        main()
+    )
