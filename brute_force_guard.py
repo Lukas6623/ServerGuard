@@ -18,31 +18,59 @@ DATA_DIR = BASE_DIR / "data"
 EVENTS_FILE = DATA_DIR / "ssh_events.json"
 BLOCKS_FILE = DATA_DIR / "blocked_ips.json"
 
+# ------------------------------------------------------------
+# Event storage limits
+# ------------------------------------------------------------
+
+# Maximum number of events stored in ssh_events.json
+MAX_EVENTS = 2000
+
+# Events older than this many days are automatically removed
+EVENT_RETENTION_DAYS = 7
+
+# Cleanup interval
+CLEANUP_INTERVAL = 60
+
+
+# ============================================================
+# WHITELIST
+# ============================================================
+
 # IMPORTANT:
 # Add your trusted/public IP here.
 # These addresses will NEVER be blocked.
+
 WHITELIST_IPS = {
     # "1.2.3.4",
 }
 
-# Number of failed attempts
+
+# ============================================================
+# BRUTE FORCE LEVELS
+# ============================================================
+
 LEVEL_1 = 5
 LEVEL_2 = 10
 LEVEL_3 = 20
 
-# Block durations
+
+# ============================================================
+# BLOCK DURATIONS
+# ============================================================
+
 BLOCK_1 = 10 * 60          # 10 minutes
 BLOCK_2 = 20 * 60          # 20 minutes
 BLOCK_3 = 2 * 60 * 60      # 2 hours
-
-MAX_EVENTS = 10000
 
 
 # ============================================================
 # DIRECTORIES
 # ============================================================
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
 
 
 # ============================================================
@@ -50,43 +78,92 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # ============================================================
 
 def load_json(path, default):
+
     try:
+
         if not path.exists():
             return default
 
-        with path.open("r", encoding="utf-8") as f:
+        with path.open(
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             data = json.load(f)
 
         return data
 
-    except Exception:
+    except Exception as e:
+
+        print(
+            f"[ERROR] Cannot load {path}: {e}",
+            flush=True
+        )
+
         return default
 
 
 def save_json(path, data):
+
     temp = path.with_suffix(".tmp")
 
-    with temp.open("w", encoding="utf-8") as f:
-        json.dump(
-            data,
-            f,
-            indent=2,
-            ensure_ascii=False
+    try:
+
+        with temp.open(
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                data,
+                f,
+                indent=2,
+                ensure_ascii=False
+            )
+
+            f.write("\n")
+
+        temp.replace(path)
+
+    except Exception as e:
+
+        print(
+            f"[ERROR] Cannot save {path}: {e}",
+            flush=True
         )
 
-    temp.replace(path)
+        try:
+
+            if temp.exists():
+                temp.unlink()
+
+        except Exception:
+            pass
 
 
 # ============================================================
 # DATA
 # ============================================================
 
-events = load_json(EVENTS_FILE, [])
+events = load_json(
+    EVENTS_FILE,
+    []
+)
 
 blocks = load_json(
     BLOCKS_FILE,
     {}
 )
+
+
+# Make sure loaded data has correct types
+
+if not isinstance(events, list):
+    events = []
+
+
+if not isinstance(blocks, dict):
+    blocks = {}
 
 
 # ============================================================
@@ -98,6 +175,7 @@ def now():
 
 
 def iso_time(timestamp=None):
+
     if timestamp is None:
         timestamp = now()
 
@@ -105,6 +183,82 @@ def iso_time(timestamp=None):
         timestamp,
         timezone.utc
     ).isoformat()
+
+
+# ============================================================
+# EVENT CLEANUP
+# ============================================================
+
+def cleanup_old_events():
+
+    global events
+
+    if not events:
+        return False
+
+    current_time = now()
+
+    cutoff = (
+        current_time
+        - EVENT_RETENTION_DAYS * 24 * 60 * 60
+    )
+
+    original_count = len(events)
+
+    # --------------------------------------------------------
+    # Remove events older than retention period
+    # --------------------------------------------------------
+
+    cleaned_events = []
+
+    for event in events:
+
+        event_time = event.get(
+            "time"
+        )
+
+        if not isinstance(
+            event_time,
+            (int, float)
+        ):
+            continue
+
+        if event_time >= cutoff:
+
+            cleaned_events.append(
+                event
+            )
+
+    events = cleaned_events
+
+    # --------------------------------------------------------
+    # Limit maximum number of events
+    # --------------------------------------------------------
+
+    if len(events) > MAX_EVENTS:
+
+        events = events[
+            -MAX_EVENTS:
+        ]
+
+    changed = (
+        len(events) != original_count
+    )
+
+    if changed:
+
+        save_json(
+            EVENTS_FILE,
+            events
+        )
+
+        print(
+            f"[CLEANUP] SSH events: "
+            f"{original_count} -> {len(events)}",
+            flush=True
+        )
+
+    return changed
 
 
 # ============================================================
@@ -121,7 +275,16 @@ IP_REGEX = re.compile(
 
 
 def valid_ip(ip):
-    return bool(IP_REGEX.match(ip))
+
+    if not ip:
+        return False
+
+    if len(ip) > 45:
+        return False
+
+    return bool(
+        IP_REGEX.match(ip)
+    )
 
 
 # ============================================================
@@ -129,14 +292,18 @@ def valid_ip(ip):
 # ============================================================
 
 def ufw_block(ip):
+
     if ip in WHITELIST_IPS:
+
         print(
             f"[WHITELIST] Refusing to block {ip}",
             flush=True
         )
+
         return False
 
     try:
+
         result = subprocess.run(
             [
                 "ufw",
@@ -153,8 +320,10 @@ def ufw_block(ip):
         return result.returncode == 0
 
     except Exception as e:
+
         print(
-            f"[ERROR] UFW block failed for {ip}: {e}",
+            f"[ERROR] UFW block failed "
+            f"for {ip}: {e}",
             flush=True
         )
 
@@ -162,10 +331,12 @@ def ufw_block(ip):
 
 
 def ufw_unblock(ip):
+
     if ip in WHITELIST_IPS:
         return
 
     try:
+
         subprocess.run(
             [
                 "ufw",
@@ -186,13 +357,26 @@ def ufw_unblock(ip):
 # BLOCK LEVEL
 # ============================================================
 
-def get_block_duration(failed_count):
+def get_block_duration(
+    failed_count
+):
 
-    if failed_count >= LEVEL_3:
+    # 21+ = permanent
+
+    if failed_count > LEVEL_3:
         return None
 
-    if failed_count >= LEVEL_2:
+    # 20 = 2 hours
+
+    if failed_count >= LEVEL_3:
         return BLOCK_3
+
+    # 10 = 20 minutes
+
+    if failed_count >= LEVEL_2:
+        return BLOCK_2
+
+    # 5 = 10 minutes
 
     if failed_count >= LEVEL_1:
         return BLOCK_1
@@ -200,7 +384,9 @@ def get_block_duration(failed_count):
     return 0
 
 
-def get_level(failed_count):
+def get_level(
+    failed_count
+):
 
     if failed_count > LEVEL_3:
         return "permanent"
@@ -221,25 +407,63 @@ def get_level(failed_count):
 # BLOCK IP
 # ============================================================
 
-def block_ip(ip, failed_count):
+def block_ip(
+    ip,
+    failed_count
+):
 
     if ip in WHITELIST_IPS:
         return
 
-    duration = get_block_duration(failed_count)
-    level = get_level(failed_count)
+    duration = get_block_duration(
+        failed_count
+    )
 
-    current = blocks.get(ip)
+    level = get_level(
+        failed_count
+    )
 
+    current = blocks.get(
+        ip
+    )
+
+    # --------------------------------------------------------
     # Already permanently blocked
-    if current and current.get("permanent"):
+    # --------------------------------------------------------
+
+    if current and current.get(
+        "permanent"
+    ):
+
         return
 
-    # Remove old temporary block from firewall
+    # --------------------------------------------------------
+    # Already temporarily blocked
+    #
+    # Do not repeatedly recreate the same UFW rule.
+    # --------------------------------------------------------
+
     if current:
+
+        expires = current.get(
+            "expires_at"
+        )
+
+        if (
+            not current.get("permanent")
+            and expires is not None
+            and now() < expires
+        ):
+
+            return
+
+        # Old temporary block
         ufw_unblock(ip)
 
+    # --------------------------------------------------------
     # Permanent block
+    # --------------------------------------------------------
+
     if duration is None:
 
         if ufw_block(ip):
@@ -251,6 +475,7 @@ def block_ip(ip, failed_count):
                 "blocked_at": now(),
                 "blocked_at_iso": iso_time(),
                 "expires_at": None,
+                "expires_at_iso": None,
                 "permanent": True
             }
 
@@ -267,8 +492,16 @@ def block_ip(ip, failed_count):
 
         return
 
+    # --------------------------------------------------------
     # Temporary block
-    expires = now() + duration
+    # --------------------------------------------------------
+
+    blocked_at = now()
+
+    expires = (
+        blocked_at
+        + duration
+    )
 
     if ufw_block(ip):
 
@@ -276,10 +509,14 @@ def block_ip(ip, failed_count):
             "ip": ip,
             "level": level,
             "failed_attempts": failed_count,
-            "blocked_at": now(),
-            "blocked_at_iso": iso_time(),
+            "blocked_at": blocked_at,
+            "blocked_at_iso": iso_time(
+                blocked_at
+            ),
             "expires_at": expires,
-            "expires_at_iso": iso_time(expires),
+            "expires_at_iso": iso_time(
+                expires
+            ),
             "permanent": False
         }
 
@@ -304,28 +541,58 @@ def cleanup_expired_blocks():
 
     changed = False
 
-    for ip in list(blocks.keys()):
+    for ip in list(
+        blocks.keys()
+    ):
+
+        # ----------------------------------------------------
+        # Whitelist protection
+        # ----------------------------------------------------
 
         if ip in WHITELIST_IPS:
+
             ufw_unblock(ip)
+
             del blocks[ip]
+
             changed = True
+
+            print(
+                f"[WHITELIST] Removed block "
+                f"for {ip}",
+                flush=True
+            )
+
             continue
 
         block = blocks[ip]
 
-        if block.get("permanent"):
+        # ----------------------------------------------------
+        # Permanent blocks stay forever
+        # ----------------------------------------------------
+
+        if block.get(
+            "permanent"
+        ):
+
             continue
 
-        expires = block.get("expires_at")
+        expires = block.get(
+            "expires_at"
+        )
 
         if expires is None:
             continue
 
+        # ----------------------------------------------------
+        # Temporary block expired
+        # ----------------------------------------------------
+
         if now() >= expires:
 
             print(
-                f"[UNBLOCK] Temporary block expired: {ip}",
+                f"[UNBLOCK] Temporary block expired: "
+                f"{ip}",
                 flush=True
             )
 
@@ -336,10 +603,22 @@ def cleanup_expired_blocks():
             changed = True
 
     if changed:
+
         save_json(
             BLOCKS_FILE,
             blocks
         )
+
+
+# ============================================================
+# GENERAL CLEANUP
+# ============================================================
+
+def cleanup():
+
+    cleanup_old_events()
+
+    cleanup_expired_blocks()
 
 
 # ============================================================
@@ -362,10 +641,19 @@ def save_event(
         "message": message
     }
 
-    events.append(event)
+    events.append(
+        event
+    )
+
+    # --------------------------------------------------------
+    # Keep only the newest events
+    # --------------------------------------------------------
 
     if len(events) > MAX_EVENTS:
-        del events[:-MAX_EVENTS]
+
+        del events[
+            :-MAX_EVENTS
+        ]
 
     save_json(
         EVENTS_FILE,
@@ -381,12 +669,37 @@ def get_failed_count(ip):
 
     count = 0
 
+    cutoff = (
+        now()
+        - EVENT_RETENTION_DAYS * 24 * 60 * 60
+    )
+
     for event in events:
 
-        if event.get("type") != "failed":
+        if event.get(
+            "type"
+        ) != "failed":
+
             continue
 
-        if event.get("ip") != ip:
+        if event.get(
+            "ip"
+        ) != ip:
+
+            continue
+
+        event_time = event.get(
+            "time"
+        )
+
+        if not isinstance(
+            event_time,
+            (int, float)
+        ):
+
+            continue
+
+        if event_time < cutoff:
             continue
 
         count += 1
@@ -436,7 +749,9 @@ def handle_failed(
         message
     )
 
-    failed_count = get_failed_count(ip)
+    failed_count = get_failed_count(
+        ip
+    )
 
     print(
         f"[SSH FAILED] "
@@ -446,14 +761,23 @@ def handle_failed(
         flush=True
     )
 
+    # --------------------------------------------------------
+    # Whitelist
+    # --------------------------------------------------------
+
     if ip in WHITELIST_IPS:
 
         print(
-            f"[WHITELIST] {ip} will never be blocked",
+            f"[WHITELIST] {ip} "
+            f"will never be blocked",
             flush=True
         )
 
         return
+
+    # --------------------------------------------------------
+    # Block after threshold
+    # --------------------------------------------------------
 
     if failed_count >= LEVEL_1:
 
@@ -468,13 +792,19 @@ def handle_failed(
 # ============================================================
 
 FAILED_REGEX = re.compile(
-    r"Failed \S+ for (?:invalid user )?(\S+) "
-    r"from ([0-9a-fA-F:.]+)"
+    r"Failed \S+ for "
+    r"(?:invalid user )?"
+    r"(\S+) "
+    r"from "
+    r"([0-9a-fA-F:.]+)"
 )
 
+
 ACCEPTED_REGEX = re.compile(
-    r"Accepted \S+ for (\S+) "
-    r"from ([0-9a-fA-F:.]+)"
+    r"Accepted \S+ for "
+    r"(\S+) "
+    r"from "
+    r"([0-9a-fA-F:.]+)"
 )
 
 
@@ -484,7 +814,9 @@ def process_log_line(line):
     # SUCCESSFUL LOGIN
     # --------------------------------------------------------
 
-    match = ACCEPTED_REGEX.search(line)
+    match = ACCEPTED_REGEX.search(
+        line
+    )
 
     if match:
 
@@ -501,12 +833,13 @@ def process_log_line(line):
 
         return
 
-
     # --------------------------------------------------------
     # FAILED LOGIN
     # --------------------------------------------------------
 
-    match = FAILED_REGEX.search(line)
+    match = FAILED_REGEX.search(
+        line
+    )
 
     if match:
 
@@ -529,6 +862,7 @@ def process_log_line(line):
 def start_journal():
 
     commands = [
+
         [
             "journalctl",
             "-f",
@@ -537,6 +871,7 @@ def start_journal():
             "-u",
             "ssh"
         ],
+
         [
             "journalctl",
             "-f",
@@ -545,6 +880,7 @@ def start_journal():
             "-u",
             "sshd"
         ],
+
         [
             "journalctl",
             "-f",
@@ -556,6 +892,7 @@ def start_journal():
     ]
 
     # Ubuntu normally uses ssh.service
+
     command = commands[0]
 
     return subprocess.Popen(
@@ -564,6 +901,35 @@ def start_journal():
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1
+    )
+
+
+# ============================================================
+# STORAGE INFORMATION
+# ============================================================
+
+def print_storage_info():
+
+    print(
+        f"[DATA] Events: {EVENTS_FILE}",
+        flush=True
+    )
+
+    print(
+        f"[DATA] Blocks: {BLOCKS_FILE}",
+        flush=True
+    )
+
+    print(
+        f"[DATA] Event retention: "
+        f"{EVENT_RETENTION_DAYS} days",
+        flush=True
+    )
+
+    print(
+        f"[DATA] Maximum events: "
+        f"{MAX_EVENTS}",
+        flush=True
     )
 
 
@@ -598,6 +964,30 @@ def main():
         flush=True
     )
 
+    print_storage_info()
+
+    print(
+        f"[DATA] Loaded events: "
+        f"{len(events)}",
+        flush=True
+    )
+
+    print(
+        f"[DATA] Loaded blocks: "
+        f"{len(blocks)}",
+        flush=True
+    )
+
+    # --------------------------------------------------------
+    # Initial cleanup
+    # --------------------------------------------------------
+
+    cleanup()
+
+    # --------------------------------------------------------
+    # Start SSH journal
+    # --------------------------------------------------------
+
     journal = start_journal()
 
     last_cleanup = 0
@@ -606,15 +996,21 @@ def main():
 
         while True:
 
+            current_time = now()
+
             # ------------------------------------------------
-            # Cleanup expired blocks every 10 seconds
+            # Cleanup every minute
             # ------------------------------------------------
 
-            if now() - last_cleanup >= 10:
+            if (
+                current_time
+                - last_cleanup
+                >= CLEANUP_INTERVAL
+            ):
 
-                cleanup_expired_blocks()
+                cleanup()
 
-                last_cleanup = now()
+                last_cleanup = current_time
 
             # ------------------------------------------------
             # Read SSH log
@@ -630,12 +1026,21 @@ def main():
 
             else:
 
-                time.sleep(0.2)
+                time.sleep(
+                    0.2
+                )
 
     except KeyboardInterrupt:
 
         print(
             "\n[STOP] ServerGuard protection stopped.",
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            f"[ERROR] Main loop: {e}",
             flush=True
         )
 
@@ -652,4 +1057,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
