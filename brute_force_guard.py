@@ -41,7 +41,7 @@ CLEANUP_INTERVAL = 60
 # These addresses will NEVER be blocked.
 
 WHITELIST_IPS = {
-    # "1.2.3.4",
+    # "1",
 }
 
 
@@ -1053,7 +1053,7 @@ def main():
 
 
 # ============================================================
-# ENTRY POINT
+# ENTRY POINT 
 # ============================================================
 
 if __name__ == "__main__":
