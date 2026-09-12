@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 
 import asyncio
@@ -63,15 +64,27 @@ def load_json(path: Path, default=None):
             return json.load(file)
 
     except Exception as exc:
-        logger.error("Failed to read %s: %s", path, exc)
+        logger.error(
+            "Failed to read %s: %s",
+            path,
+            exc
+        )
+
         return default
 
 
 def save_json(path: Path, data):
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.with_suffix(
+        path.suffix + ".tmp"
+    )
 
     try:
-        with open(temporary, "w", encoding="utf-8") as file:
+        with open(
+            temporary,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
             json.dump(
                 data,
                 file,
@@ -79,10 +92,18 @@ def save_json(path: Path, data):
                 ensure_ascii=False
             )
 
-        os.replace(temporary, path)
+        os.replace(
+            temporary,
+            path
+        )
 
     except Exception as exc:
-        logger.error("Failed to write %s: %s", path, exc)
+
+        logger.error(
+            "Failed to write %s: %s",
+            path,
+            exc
+        )
 
         try:
             if temporary.exists():
@@ -96,16 +117,32 @@ def save_json(path: Path, data):
 # ============================================================
 
 def load_config():
+
     if not CONFIG_FILE.exists():
-        logger.error("Telegram configuration does not exist.")
-        logger.error("Expected: %s", CONFIG_FILE)
+
+        logger.error(
+            "Telegram configuration does not exist."
+        )
+
+        logger.error(
+            "Expected: %s",
+            CONFIG_FILE
+        )
+
         return None
 
     config = {}
 
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as file:
+
+        with open(
+            CONFIG_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
             for line in file:
+
                 line = line.strip()
 
                 if not line:
@@ -117,7 +154,10 @@ def load_config():
                 if "=" not in line:
                     continue
 
-                key, value = line.split("=", 1)
+                key, value = line.split(
+                    "=",
+                    1
+                )
 
                 key = key.strip()
                 value = value.strip()
@@ -125,13 +165,25 @@ def load_config():
                 config[key] = value
 
     except Exception as exc:
-        logger.error("Cannot read telegram.conf: %s", exc)
+
+        logger.error(
+            "Cannot read telegram.conf: %s",
+            exc
+        )
+
         return None
 
-    token = config.get("BOT_TOKEN", "").strip()
+    token = config.get(
+        "BOT_TOKEN",
+        ""
+    ).strip()
 
     if not token:
-        logger.error("BOT_TOKEN is missing.")
+
+        logger.error(
+            "BOT_TOKEN is missing."
+        )
+
         return None
 
     return {
@@ -144,7 +196,11 @@ def load_config():
 # ============================================================
 
 def get_owner():
-    owner = load_json(OWNER_FILE, None)
+
+    owner = load_json(
+        OWNER_FILE,
+        None
+    )
 
     if not isinstance(owner, dict):
         return None
@@ -161,12 +217,16 @@ def get_owner():
 
 
 def is_owner(chat_id: int) -> bool:
+
     owner = get_owner()
 
     if owner is None:
         return False
 
-    return str(owner.get("chat_id")) == str(chat_id)
+    return (
+        str(owner.get("chat_id"))
+        == str(chat_id)
+    )
 
 
 # ============================================================
@@ -174,31 +234,46 @@ def is_owner(chat_id: int) -> bool:
 # ============================================================
 
 def get_verification():
+
     verification = load_json(
         VERIFICATION_FILE,
         None
     )
 
-    if not isinstance(verification, dict):
+    if not isinstance(
+        verification,
+        dict
+    ):
         return None
 
     return verification
 
 
-def verification_is_valid(code: str) -> bool:
+def verification_is_valid(
+    code: str
+) -> bool:
+
     verification = get_verification()
 
     if verification is None:
         return False
 
     expected_code = str(
-        verification.get("code", "")
+        verification.get(
+            "code",
+            ""
+        )
     ).strip()
 
-    expires_at = verification.get("expires_at", 0)
+    expires_at = verification.get(
+        "expires_at",
+        0
+    )
 
     try:
-        expires_at = float(expires_at)
+        expires_at = float(
+            expires_at
+        )
     except Exception:
         return False
 
@@ -222,20 +297,33 @@ def consume_verification(
     if not verification_is_valid(code):
         return False
 
+    user = message.from_user
+
     owner = {
         "chat_id": message.chat.id,
-        "user_id": message.from_user.id if message.from_user else None,
+
+        "user_id": (
+            user.id
+            if user
+            else None
+        ),
+
         "username": (
-            message.from_user.username
-            if message.from_user
+            user.username
+            if user
             else None
         ),
+
         "first_name": (
-            message.from_user.first_name
-            if message.from_user
+            user.first_name
+            if user
             else None
         ),
-        "registered_at": int(time.time()),
+
+        "registered_at": int(
+            time.time()
+        ),
+
         "verified": True
     }
 
@@ -244,11 +332,17 @@ def consume_verification(
         owner
     )
 
+    # --------------------------------------------------------
     # Verification code becomes invalid immediately.
+    # --------------------------------------------------------
+
     try:
+
         if VERIFICATION_FILE.exists():
             VERIFICATION_FILE.unlink()
+
     except Exception as exc:
+
         logger.error(
             "Cannot remove verification file: %s",
             exc
@@ -261,16 +355,13 @@ def consume_verification(
 # START COMMAND
 # ============================================================
 
-@Dispatcher().message()
-async def unused_handler(message: Message):
-    pass
-
-
 dp = Dispatcher()
 
 
 @dp.message(CommandStart())
-async def command_start(message: Message):
+async def command_start(
+    message: Message
+):
 
     if message.from_user is None:
         return
@@ -303,13 +394,15 @@ async def command_start(message: Message):
 
         await message.answer(
             "❌ <b>Access denied.</b>\n\n"
-            "This ServerGuard bot is already registered "
-            "to its owner.\n\n"
-            "You cannot register another Telegram account."
+            "This ServerGuard bot is already "
+            "registered to its owner.\n\n"
+            "You cannot register another "
+            "Telegram account."
         )
 
         logger.warning(
-            "Unauthorized Telegram user tried to access bot: chat_id=%s",
+            "Unauthorized Telegram user tried "
+            "to access bot: chat_id=%s",
             chat_id
         )
 
@@ -321,7 +414,9 @@ async def command_start(message: Message):
 
     text = message.text or ""
 
-    parts = text.split(maxsplit=1)
+    parts = text.split(
+        maxsplit=1
+    )
 
     code = ""
 
@@ -337,10 +432,11 @@ async def command_start(message: Message):
         await message.answer(
             "🛡 <b>ServerGuard</b>\n\n"
             "This bot is protected.\n\n"
-            "Registration requires a verification code "
-            "generated by ServerGuard.\n\n"
-            "Send the verification command provided "
-            "by ServerGuard."
+            "Registration requires a "
+            "verification code generated "
+            "by ServerGuard.\n\n"
+            "Send the verification command "
+            "provided by ServerGuard."
         )
 
         return
@@ -349,11 +445,15 @@ async def command_start(message: Message):
     # CODE FORMAT
     # --------------------------------------------------------
 
-    if not re.fullmatch(r"\d{6}", code):
+    if not re.fullmatch(
+        r"\d{6}",
+        code
+    ):
 
         await message.answer(
             "❌ <b>Invalid verification code.</b>\n\n"
-            "The code must contain exactly 6 digits."
+            "The code must contain exactly "
+            "6 digits."
         )
 
         return
@@ -372,7 +472,8 @@ async def command_start(message: Message):
         )
 
         logger.warning(
-            "Failed Telegram verification: chat_id=%s",
+            "Failed Telegram verification: "
+            "chat_id=%s",
             chat_id
         )
 
@@ -382,19 +483,24 @@ async def command_start(message: Message):
     # REGISTER OWNER
     # --------------------------------------------------------
 
-    if consume_verification(message, code):
+    if consume_verification(
+        message,
+        code
+    ):
 
         await message.answer(
             "🛡 <b>ServerGuard</b>\n\n"
             "✅ <b>Verification successful!</b>\n\n"
-            "👤 Telegram account registered as owner.\n"
+            "👤 Telegram account registered "
+            "as owner.\n"
             "🔔 Security alerts: <b>ENABLED</b>\n\n"
             "Critical ServerGuard security events "
             "will now be sent to this chat."
         )
 
         logger.info(
-            "Telegram owner registered: chat_id=%s username=%s",
+            "Telegram owner registered: "
+            "chat_id=%s username=%s",
             chat_id,
             message.from_user.username
         )
@@ -411,14 +517,19 @@ async def command_start(message: Message):
 # ============================================================
 
 @dp.message()
-async def normal_message(message: Message):
+async def normal_message(
+    message: Message
+):
 
     if message.from_user is None:
         return
 
     chat_id = message.chat.id
 
-    # Only owner receives useful responses.
+    # --------------------------------------------------------
+    # ONLY OWNER
+    # --------------------------------------------------------
+
     if not is_owner(chat_id):
 
         await message.answer(
@@ -429,7 +540,13 @@ async def normal_message(message: Message):
 
         return
 
-    text = (message.text or "").strip()
+    text = (
+        message.text or ""
+    ).strip()
+
+    # --------------------------------------------------------
+    # STATUS
+    # --------------------------------------------------------
 
     if text == "/status":
 
@@ -441,6 +558,10 @@ async def normal_message(message: Message):
         )
 
         return
+
+    # --------------------------------------------------------
+    # UNKNOWN COMMAND
+    # --------------------------------------------------------
 
     await message.answer(
         "🛡 <b>ServerGuard</b>\n\n"
@@ -454,7 +575,9 @@ async def normal_message(message: Message):
 # TELEGRAM ALERT QUEUE
 # ============================================================
 
-async def process_alert_queue(bot: Bot):
+async def process_alert_queue(
+    bot: Bot
+):
 
     logger.info(
         "Telegram alert worker started."
@@ -467,13 +590,23 @@ async def process_alert_queue(bot: Bot):
             owner = get_owner()
 
             if owner is None:
-                await asyncio.sleep(POLL_INTERVAL)
+
+                await asyncio.sleep(
+                    POLL_INTERVAL
+                )
+
                 continue
 
-            chat_id = owner.get("chat_id")
+            chat_id = owner.get(
+                "chat_id"
+            )
 
             if chat_id is None:
-                await asyncio.sleep(POLL_INTERVAL)
+
+                await asyncio.sleep(
+                    POLL_INTERVAL
+                )
+
                 continue
 
             files = sorted(
@@ -489,7 +622,11 @@ async def process_alert_queue(bot: Bot):
                         None
                     )
 
-                    if not isinstance(alert, dict):
+                    if not isinstance(
+                        alert,
+                        dict
+                    ):
+
                         logger.error(
                             "Invalid alert file: %s",
                             alert_file
@@ -501,9 +638,12 @@ async def process_alert_queue(bot: Bot):
 
                         continue
 
-                    text = alert.get("message")
+                    text = alert.get(
+                        "message"
+                    )
 
                     if not text:
+
                         logger.error(
                             "Alert without message: %s",
                             alert_file
@@ -541,13 +681,16 @@ async def process_alert_queue(bot: Bot):
                 except Exception as exc:
 
                     logger.error(
-                        "Failed to send Telegram alert %s: %s",
+                        "Failed to send Telegram alert "
+                        "%s: %s",
                         alert_file.name,
                         exc
                     )
 
-                    # Do NOT delete file.
-                    # It will be retried later.
+                    # ------------------------------------------------
+                    # DO NOT DELETE FILE.
+                    # IT WILL BE RETRIED.
+                    # ------------------------------------------------
 
         except Exception as exc:
 
@@ -556,7 +699,9 @@ async def process_alert_queue(bot: Bot):
                 exc
             )
 
-        await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.sleep(
+            POLL_INTERVAL
+        )
 
 
 # ============================================================
@@ -568,9 +713,11 @@ async def main():
     config = load_config()
 
     if config is None:
+
         logger.error(
             "Telegram bot cannot start."
         )
+
         return
 
     token = config["token"]
@@ -586,7 +733,13 @@ async def main():
         )
     )
 
+    worker = None
+
     try:
+
+        # ----------------------------------------------------
+        # CHECK TELEGRAM CONNECTION
+        # ----------------------------------------------------
 
         me = await bot.get_me()
 
@@ -595,27 +748,42 @@ async def main():
             me.username
         )
 
-        # Start alert worker.
+        # ----------------------------------------------------
+        # START ALERT WORKER
+        # ----------------------------------------------------
+
         worker = asyncio.create_task(
             process_alert_queue(bot)
         )
 
-        try:
+        # ----------------------------------------------------
+        # START POLLING
+        # ----------------------------------------------------
 
-            await dp.start_polling(
-                bot
-            )
+        await dp.start_polling(
+            bot
+        )
 
-        finally:
+    except Exception as exc:
+
+        logger.exception(
+            "Telegram bot error: %s",
+            exc
+        )
+
+        raise
+
+    finally:
+
+        if worker is not None:
 
             worker.cancel()
 
             try:
                 await worker
+
             except asyncio.CancelledError:
                 pass
-
-    finally:
 
         await bot.session.close()
 
@@ -631,10 +799,14 @@ async def main():
 if __name__ == "__main__":
 
     try:
-        asyncio.run(main())
+
+        asyncio.run(
+            main()
+        )
 
     except KeyboardInterrupt:
 
         logger.info(
-            "ServerGuard Telegram Bot stopped by user."
+            "ServerGuard Telegram Bot stopped "
+            "by user."
         )
