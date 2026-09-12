@@ -12,6 +12,9 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
+# ============================================================
+# version (1.1)
+# ============================================================
 
 # ============================================================
 # PATHS
