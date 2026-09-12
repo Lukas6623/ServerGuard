@@ -1,11 +1,6 @@
-
-#!/usr/bin/env python3
-
 import asyncio
 import json
-import logging
 import os
-import re
 import time
 from pathlib import Path
 
@@ -17,7 +12,7 @@ from aiogram.types import Message
 
 
 # ============================================================
-# SERVERGUARD TELEGRAM BOT
+# PATHS
 # ============================================================
 
 BASE_DIR = Path("/opt/serverguard")
@@ -32,18 +27,6 @@ POLL_INTERVAL = 2
 
 
 # ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-
-logger = logging.getLogger("ServerGuardTelegram")
-
-
-# ============================================================
 # DIRECTORIES
 # ============================================================
 
@@ -52,64 +35,51 @@ QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
-# FILE HELPERS
+# DISPATCHER
 # ============================================================
 
-def load_json(path: Path, default=None):
+dp = Dispatcher()
+
+
+# ============================================================
+# JSON HELPERS
+# ============================================================
+
+def load_json(path: Path):
     try:
         if not path.exists():
-            return default
+            return None
 
-        with open(path, "r", encoding="utf-8") as file:
-            return json.load(file)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
-    except Exception as exc:
-        logger.error(
-            "Failed to read %s: %s",
-            path,
-            exc
-        )
-
-        return default
+    except Exception:
+        return None
 
 
 def save_json(path: Path, data):
-    temporary = path.with_suffix(
-        path.suffix + ".tmp"
-    )
+    temp_path = path.with_suffix(".tmp")
 
     try:
-        with open(
-            temporary,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(
                 data,
-                file,
-                indent=4,
-                ensure_ascii=False
+                f,
+                ensure_ascii=False,
+                indent=2
             )
 
-        os.replace(
-            temporary,
-            path
-        )
+        os.replace(temp_path, path)
+        return True
 
-    except Exception as exc:
-
-        logger.error(
-            "Failed to write %s: %s",
-            path,
-            exc
-        )
-
+    except Exception:
         try:
-            if temporary.exists():
-                temporary.unlink()
+            if temp_path.exists():
+                temp_path.unlink()
         except Exception:
             pass
+
+        return False
 
 
 # ============================================================
@@ -117,78 +87,25 @@ def save_json(path: Path, data):
 # ============================================================
 
 def load_config():
-
     if not CONFIG_FILE.exists():
-
-        logger.error(
-            "Telegram configuration does not exist."
-        )
-
-        logger.error(
-            "Expected: %s",
-            CONFIG_FILE
-        )
-
         return None
 
-    config = {}
-
     try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
 
-        with open(
-            CONFIG_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            for line in file:
-
+            for line in f:
                 line = line.strip()
 
                 if not line:
                     continue
 
-                if line.startswith("#"):
-                    continue
+                if line.startswith("BOT_TOKEN="):
+                    return line.split("=", 1)[1].strip()
 
-                if "=" not in line:
-                    continue
+    except Exception:
+        pass
 
-                key, value = line.split(
-                    "=",
-                    1
-                )
-
-                key = key.strip()
-                value = value.strip()
-
-                config[key] = value
-
-    except Exception as exc:
-
-        logger.error(
-            "Cannot read telegram.conf: %s",
-            exc
-        )
-
-        return None
-
-    token = config.get(
-        "BOT_TOKEN",
-        ""
-    ).strip()
-
-    if not token:
-
-        logger.error(
-            "BOT_TOKEN is missing."
-        )
-
-        return None
-
-    return {
-        "token": token
-    }
+    return None
 
 
 # ============================================================
@@ -196,37 +113,31 @@ def load_config():
 # ============================================================
 
 def get_owner():
+    data = load_json(OWNER_FILE)
 
-    owner = load_json(
-        OWNER_FILE,
-        None
-    )
-
-    if not isinstance(owner, dict):
+    if not data:
         return None
 
-    if not owner.get("verified"):
+    if not data.get("verified"):
         return None
 
-    chat_id = owner.get("chat_id")
-
-    if chat_id is None:
+    if not data.get("chat_id"):
         return None
 
-    return owner
+    return data
 
 
-def is_owner(chat_id: int) -> bool:
-
+def is_owner(chat_id: int):
     owner = get_owner()
 
-    if owner is None:
+    if not owner:
         return False
 
-    return (
-        str(owner.get("chat_id"))
-        == str(chat_id)
-    )
+    try:
+        return int(owner["chat_id"]) == int(chat_id)
+
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -234,282 +145,179 @@ def is_owner(chat_id: int) -> bool:
 # ============================================================
 
 def get_verification():
+    data = load_json(VERIFICATION_FILE)
 
-    verification = load_json(
-        VERIFICATION_FILE,
-        None
-    )
-
-    if not isinstance(
-        verification,
-        dict
-    ):
+    if not data:
         return None
 
-    return verification
+    code = str(data.get("code", ""))
+    expires_at = float(data.get("expires_at", 0))
+
+    if not code:
+        return None
+
+    if time.time() > expires_at:
+        try:
+            VERIFICATION_FILE.unlink()
+        except Exception:
+            pass
+
+        return None
+
+    return data
 
 
-def verification_is_valid(
-    code: str
-) -> bool:
+def consume_verification(message: Message):
 
     verification = get_verification()
 
-    if verification is None:
+    if not verification:
         return False
 
-    expected_code = str(
-        verification.get(
-            "code",
-            ""
-        )
-    ).strip()
-
-    expires_at = verification.get(
-        "expires_at",
-        0
-    )
-
-    try:
-        expires_at = float(
-            expires_at
-        )
-    except Exception:
-        return False
-
-    if not expected_code:
-        return False
-
-    if expected_code != code:
-        return False
-
-    if time.time() > expires_at:
-        return False
-
-    return True
-
-
-def consume_verification(
-    message: Message,
-    code: str
-) -> bool:
-
-    if not verification_is_valid(code):
-        return False
+    code = str(verification.get("code", ""))
 
     user = message.from_user
 
-    owner = {
+    owner_data = {
         "chat_id": message.chat.id,
-
-        "user_id": (
-            user.id
-            if user
-            else None
-        ),
-
-        "username": (
-            user.username
-            if user
-            else None
-        ),
-
-        "first_name": (
-            user.first_name
-            if user
-            else None
-        ),
-
-        "registered_at": int(
-            time.time()
-        ),
-
+        "user_id": user.id if user else None,
+        "username": user.username if user else None,
+        "first_name": user.first_name if user else None,
+        "registered_at": int(time.time()),
         "verified": True
     }
 
-    save_json(
-        OWNER_FILE,
-        owner
-    )
-
-    # --------------------------------------------------------
-    # Verification code becomes invalid immediately.
-    # --------------------------------------------------------
+    if not save_json(OWNER_FILE, owner_data):
+        return False
 
     try:
-
-        if VERIFICATION_FILE.exists():
-            VERIFICATION_FILE.unlink()
-
-    except Exception as exc:
-
-        logger.error(
-            "Cannot remove verification file: %s",
-            exc
-        )
+        VERIFICATION_FILE.unlink()
+    except Exception:
+        pass
 
     return True
 
 
 # ============================================================
-# START COMMAND
+# /START
 # ============================================================
 
-dp = Dispatcher()
-
-
 @dp.message(CommandStart())
-async def command_start(
-    message: Message
-):
-
-    if message.from_user is None:
-        return
+async def command_start(message: Message):
 
     chat_id = message.chat.id
 
     # --------------------------------------------------------
-    # ALREADY REGISTERED OWNER
+    # Already owner
     # --------------------------------------------------------
 
     if is_owner(chat_id):
 
         await message.answer(
             "🛡 <b>ServerGuard</b>\n\n"
-            "✅ Owner verification: <b>OK</b>\n"
-            "🔔 Telegram alerts: <b>ENABLED</b>\n\n"
-            "This Telegram account is registered "
-            "as the ServerGuard owner."
+            "✅ Вы уже зарегистрированы как владелец.\n"
+            "🔔 Уведомления безопасности включены.\n\n"
+            "Доступные команды:\n"
+            "/status — состояние защиты"
         )
 
         return
 
     # --------------------------------------------------------
-    # ANOTHER USER WHEN OWNER ALREADY EXISTS
+    # Another user when owner already exists
     # --------------------------------------------------------
 
     owner = get_owner()
 
-    if owner is not None:
+    if owner:
 
         await message.answer(
-            "❌ <b>Access denied.</b>\n\n"
-            "This ServerGuard bot is already "
-            "registered to its owner.\n\n"
-            "You cannot register another "
-            "Telegram account."
-        )
-
-        logger.warning(
-            "Unauthorized Telegram user tried "
-            "to access bot: chat_id=%s",
-            chat_id
+            "⛔ <b>Доступ запрещён.</b>\n\n"
+            "Этот бот уже привязан к владельцу сервера."
         )
 
         return
 
     # --------------------------------------------------------
-    # GET /start ARGUMENT
+    # Get command arguments
     # --------------------------------------------------------
 
     text = message.text or ""
 
-    parts = text.split(
-        maxsplit=1
-    )
+    parts = text.split(maxsplit=1)
 
-    code = ""
-
-    if len(parts) == 2:
-        code = parts[1].strip()
-
-    # --------------------------------------------------------
-    # NO CODE
-    # --------------------------------------------------------
-
-    if not code:
+    if len(parts) < 2:
 
         await message.answer(
             "🛡 <b>ServerGuard</b>\n\n"
-            "This bot is protected.\n\n"
-            "Registration requires a "
-            "verification code generated "
-            "by ServerGuard.\n\n"
-            "Send the verification command "
-            "provided by ServerGuard."
+            "Для регистрации необходимо ввести "
+            "код подтверждения.\n\n"
+            "Пример:\n"
+            "<code>/start 123456</code>"
         )
 
         return
 
+    code = parts[1].strip()
+
     # --------------------------------------------------------
-    # CODE FORMAT
+    # Code format
     # --------------------------------------------------------
 
-    if not re.fullmatch(
-        r"\d{6}",
-        code
-    ):
+    if not code.isdigit() or len(code) != 6:
 
         await message.answer(
-            "❌ <b>Invalid verification code.</b>\n\n"
-            "The code must contain exactly "
-            "6 digits."
+            "❌ Неверный формат кода.\n\n"
+            "Код должен состоять из <b>6 цифр</b>."
         )
 
         return
 
     # --------------------------------------------------------
-    # VERIFY
+    # Check verification
     # --------------------------------------------------------
 
-    if not verification_is_valid(code):
+    verification = get_verification()
+
+    if not verification:
 
         await message.answer(
-            "❌ <b>Verification failed.</b>\n\n"
-            "The code is invalid or expired.\n\n"
-            "Generate a new verification code "
-            "from ServerGuard."
-        )
-
-        logger.warning(
-            "Failed Telegram verification: "
-            "chat_id=%s",
-            chat_id
+            "❌ Код подтверждения отсутствует "
+            "или уже истёк.\n\n"
+            "Сгенерируйте новый код через ServerGuard."
         )
 
         return
 
-    # --------------------------------------------------------
-    # REGISTER OWNER
-    # --------------------------------------------------------
+    expected_code = str(verification.get("code", ""))
 
-    if consume_verification(
-        message,
-        code
-    ):
+    if code != expected_code:
 
         await message.answer(
-            "🛡 <b>ServerGuard</b>\n\n"
-            "✅ <b>Verification successful!</b>\n\n"
-            "👤 Telegram account registered "
-            "as owner.\n"
-            "🔔 Security alerts: <b>ENABLED</b>\n\n"
-            "Critical ServerGuard security events "
-            "will now be sent to this chat."
-        )
-
-        logger.info(
-            "Telegram owner registered: "
-            "chat_id=%s username=%s",
-            chat_id,
-            message.from_user.username
+            "❌ Неверный код подтверждения."
         )
 
         return
 
-    await message.answer(
-        "❌ Verification failed."
-    )
+    # --------------------------------------------------------
+    # Register owner
+    # --------------------------------------------------------
+
+    if consume_verification(message):
+
+        await message.answer(
+            "✅ <b>Регистрация успешно завершена!</b>\n\n"
+            "🛡 Вы назначены владельцем ServerGuard.\n"
+            "🔔 Уведомления безопасности включены.\n\n"
+            "Теперь бот принимает события безопасности "
+            "от вашего ServerGuard."
+        )
+
+    else:
+
+        await message.answer(
+            "❌ Не удалось сохранить регистрацию владельца."
+        )
 
 
 # ============================================================
@@ -517,71 +325,57 @@ async def command_start(
 # ============================================================
 
 @dp.message()
-async def normal_message(
-    message: Message
-):
-
-    if message.from_user is None:
-        return
+async def normal_message(message: Message):
 
     chat_id = message.chat.id
 
     # --------------------------------------------------------
-    # ONLY OWNER
+    # Not owner
     # --------------------------------------------------------
 
     if not is_owner(chat_id):
 
         await message.answer(
-            "🔒 <b>ServerGuard</b>\n\n"
-            "Access denied.\n"
-            "Owner verification is required."
+            "⛔ <b>Доступ запрещён.</b>\n\n"
+            "Этот Telegram-бот предназначен только "
+            "для владельца сервера."
         )
 
         return
 
-    text = (
-        message.text or ""
-    ).strip()
+    # --------------------------------------------------------
+    # Status
+    # --------------------------------------------------------
 
-    # --------------------------------------------------------
-    # STATUS
-    # --------------------------------------------------------
+    text = (message.text or "").strip()
 
     if text == "/status":
 
         await message.answer(
             "🛡 <b>ServerGuard</b>\n\n"
-            "Owner: ✅ verified\n"
-            "Telegram alerts: ✅ enabled\n"
-            "Security channel: 🟢 active"
+            "🟢 Владелец подтверждён\n"
+            "🟢 Telegram-уведомления активны\n"
+            "🟢 Защита сервера активна"
         )
 
         return
 
     # --------------------------------------------------------
-    # UNKNOWN COMMAND
+    # Unknown command
     # --------------------------------------------------------
 
     await message.answer(
         "🛡 <b>ServerGuard</b>\n\n"
-        "Telegram security channel is active.\n\n"
-        "Available command:\n"
-        "/status"
+        "Доступные команды:\n"
+        "/status — состояние защиты"
     )
 
 
 # ============================================================
-# TELEGRAM ALERT QUEUE
+# ALERT QUEUE
 # ============================================================
 
-async def process_alert_queue(
-    bot: Bot
-):
-
-    logger.info(
-        "Telegram alert worker started."
-    )
+async def alert_worker(bot: Bot):
 
     while True:
 
@@ -589,119 +383,54 @@ async def process_alert_queue(
 
             owner = get_owner()
 
-            if owner is None:
-
-                await asyncio.sleep(
-                    POLL_INTERVAL
-                )
-
+            if not owner:
+                await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            chat_id = owner.get(
-                "chat_id"
-            )
+            chat_id = owner.get("chat_id")
 
-            if chat_id is None:
-
-                await asyncio.sleep(
-                    POLL_INTERVAL
-                )
-
+            if not chat_id:
+                await asyncio.sleep(POLL_INTERVAL)
                 continue
 
             files = sorted(
-                QUEUE_DIR.glob("*.json")
+                QUEUE_DIR.glob("*.json"),
+                key=lambda p: p.stat().st_mtime
             )
 
-            for alert_file in files:
+            for file_path in files:
+
+                data = load_json(file_path)
+
+                if not data:
+                    continue
+
+                message_text = data.get("message")
+
+                if not message_text:
+                    continue
 
                 try:
 
-                    alert = load_json(
-                        alert_file,
-                        None
-                    )
-
-                    if not isinstance(
-                        alert,
-                        dict
-                    ):
-
-                        logger.error(
-                            "Invalid alert file: %s",
-                            alert_file
-                        )
-
-                        alert_file.unlink(
-                            missing_ok=True
-                        )
-
-                        continue
-
-                    text = alert.get(
-                        "message"
-                    )
-
-                    if not text:
-
-                        logger.error(
-                            "Alert without message: %s",
-                            alert_file
-                        )
-
-                        alert_file.unlink(
-                            missing_ok=True
-                        )
-
-                        continue
-
-                    # ------------------------------------------------
-                    # SEND ALERT
-                    # ------------------------------------------------
-
                     await bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        parse_mode=ParseMode.HTML
+                        chat_id=int(chat_id),
+                        text=message_text
                     )
 
-                    # ------------------------------------------------
-                    # DELETE ONLY AFTER SUCCESSFUL SEND
-                    # ------------------------------------------------
+                    # Delete only after successful sending
+                    try:
+                        file_path.unlink()
+                    except Exception:
+                        pass
 
-                    alert_file.unlink(
-                        missing_ok=True
-                    )
+                except Exception:
+                    # Keep file for retry
+                    pass
 
-                    logger.info(
-                        "Telegram alert sent: %s",
-                        alert_file.name
-                    )
+        except Exception:
+            pass
 
-                except Exception as exc:
-
-                    logger.error(
-                        "Failed to send Telegram alert "
-                        "%s: %s",
-                        alert_file.name,
-                        exc
-                    )
-
-                    # ------------------------------------------------
-                    # DO NOT DELETE FILE.
-                    # IT WILL BE RETRIED.
-                    # ------------------------------------------------
-
-        except Exception as exc:
-
-            logger.error(
-                "Alert worker error: %s",
-                exc
-            )
-
-        await asyncio.sleep(
-            POLL_INTERVAL
-        )
+        await asyncio.sleep(POLL_INTERVAL)
 
 
 # ============================================================
@@ -710,21 +439,12 @@ async def process_alert_queue(
 
 async def main():
 
-    config = load_config()
+    token = load_config()
 
-    if config is None:
+    if not token:
 
-        logger.error(
-            "Telegram bot cannot start."
-        )
-
+        print("ERROR: Telegram bot token not found.")
         return
-
-    token = config["token"]
-
-    logger.info(
-        "Starting ServerGuard Telegram Bot..."
-    )
 
     bot = Bot(
         token=token,
@@ -733,63 +453,53 @@ async def main():
         )
     )
 
-    worker = None
+    worker_task = None
 
     try:
 
         # ----------------------------------------------------
-        # CHECK TELEGRAM CONNECTION
+        # Check bot token
         # ----------------------------------------------------
 
         me = await bot.get_me()
 
-        logger.info(
-            "Connected to Telegram as @%s",
-            me.username
+        print(
+            f"Telegram bot started: "
+            f"@{me.username}"
         )
 
         # ----------------------------------------------------
-        # START ALERT WORKER
+        # Start alert worker
         # ----------------------------------------------------
 
-        worker = asyncio.create_task(
-            process_alert_queue(bot)
+        worker_task = asyncio.create_task(
+            alert_worker(bot)
         )
 
         # ----------------------------------------------------
-        # START POLLING
+        # Start polling
         # ----------------------------------------------------
 
-        await dp.start_polling(
-            bot
+        await dp.start_polling(bot)
+
+    except Exception as e:
+
+        print(
+            f"Telegram bot error: {e}"
         )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Telegram bot error: %s",
-            exc
-        )
-
-        raise
 
     finally:
 
-        if worker is not None:
+        if worker_task:
 
-            worker.cancel()
+            worker_task.cancel()
 
             try:
-                await worker
-
+                await worker_task
             except asyncio.CancelledError:
                 pass
 
         await bot.session.close()
-
-        logger.info(
-            "ServerGuard Telegram Bot stopped."
-        )
 
 
 # ============================================================
@@ -797,16 +507,4 @@ async def main():
 # ============================================================
 
 if __name__ == "__main__":
-
-    try:
-
-        asyncio.run(
-            main()
-        )
-
-    except KeyboardInterrupt:
-
-        logger.info(
-            "ServerGuard Telegram Bot stopped "
-            "by user."
-        )
+    asyncio.run(main())
