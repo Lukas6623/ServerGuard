@@ -9,6 +9,40 @@ from datetime import datetime, timezone
 
 
 # ============================================================
+# SERVERGUARD SSH PROTECTION
+# ============================================================
+#
+# This version:
+#
+#   1. Separates successful and failed SSH logins.
+#   2. Keeps total failed attempts for statistics.
+#   3. Uses a CURRENT FAILED STREAK for blocking.
+#      A successful login resets the current streak to 0.
+#   4. Supports trusted OWNER SSH keys by fingerprint.
+#      The owner is NOT trusted by IP address.
+#   5. Dynamic public IPs therefore do not need to be whitelisted.
+#   6. Password logins are never considered an owner key.
+#
+# Owner configuration:
+#
+#   /opt/serverguard/data/owner_keys.json
+#
+# Example:
+#
+# {
+#   "usernames": ["root"],
+#   "fingerprints": [
+#       "SHA256:YOUR_SSH_PUBLIC_KEY_FINGERPRINT"
+#   ]
+# }
+#
+# The fingerprint must come from a real successful SSH public-key
+# login. Never put a private key in this file.
+#
+# ============================================================
+
+
+# ============================================================
 # CONFIGURATION
 # ============================================================
 
@@ -19,18 +53,15 @@ EVENTS_FILE = DATA_DIR / "ssh_events.json"
 BLOCKS_FILE = DATA_DIR / "blocked_ips.json"
 STATS_FILE = DATA_DIR / "ip_stats.json"
 
+OWNER_CONFIG_FILE = DATA_DIR / "owner_keys.json"
+
 
 # ============================================================
 # EVENT STORAGE LIMITS
 # ============================================================
 
-# Maximum number of events stored in ssh_events.json
 MAX_EVENTS = 2000
-
-# Events older than this many days are automatically removed
 EVENT_RETENTION_DAYS = 7
-
-# Cleanup interval
 CLEANUP_INTERVAL = 60
 
 
@@ -38,27 +69,31 @@ CLEANUP_INTERVAL = 60
 # IP STATISTICS LIMITS
 # ============================================================
 
-# IP statistics are removed if the IP has no activity
-# for this many days.
-#
-# This prevents ip_stats.json from growing forever.
-#
-# IMPORTANT:
-# Active/permanently blocked IPs are NOT removed.
-#
 STATS_RETENTION_DAYS = 30
 
 
 # ============================================================
-# WHITELIST
+# EMERGENCY STATIC WHITELIST
 # ============================================================
-
-# IMPORTANT:
-# Add your trusted/public IP here.
-# These addresses will NEVER be blocked.
+#
+# This is intentionally NOT the owner mechanism.
+#
+# Normally leave this empty.
+#
+# A static IP can be placed here only if you deliberately want
+# that IP to NEVER be blocked.
+#
+# Example:
+#
+# WHITELIST_IPS = {
+#     "1.2.3.4",
+# }
+#
+# Do NOT put a dynamic home IP here.
+#
 
 WHITELIST_IPS = {
-    # "1.1",
+    # "1.2.3.4",
 }
 
 
@@ -75,9 +110,9 @@ LEVEL_3 = 20
 # BLOCK DURATIONS
 # ============================================================
 
-BLOCK_1 = 10 * 60          # 10 minutes
-BLOCK_2 = 20 * 60          # 20 minutes
-BLOCK_3 = 2 * 60 * 60      # 2 hours
+BLOCK_1 = 10 * 60
+BLOCK_2 = 20 * 60
+BLOCK_3 = 2 * 60 * 60
 
 
 # ============================================================
@@ -177,6 +212,14 @@ ip_stats = load_json(
     {}
 )
 
+owner_config = load_json(
+    OWNER_CONFIG_FILE,
+    {
+        "usernames": [],
+        "fingerprints": []
+    }
+)
+
 
 # ============================================================
 # DATA VALIDATION
@@ -185,13 +228,26 @@ ip_stats = load_json(
 if not isinstance(events, list):
     events = []
 
-
 if not isinstance(blocks, dict):
     blocks = {}
 
-
 if not isinstance(ip_stats, dict):
     ip_stats = {}
+
+if not isinstance(owner_config, dict):
+    owner_config = {}
+
+if not isinstance(
+    owner_config.get("usernames"),
+    list
+):
+    owner_config["usernames"] = []
+
+if not isinstance(
+    owner_config.get("fingerprints"),
+    list
+):
+    owner_config["fingerprints"] = []
 
 
 # ============================================================
@@ -243,6 +299,108 @@ def valid_ip(ip):
 
 
 # ============================================================
+# OWNER CONFIGURATION
+# ============================================================
+
+def get_owner_usernames():
+
+    result = set()
+
+    for username in owner_config.get(
+        "usernames",
+        []
+    ):
+
+        if isinstance(username, str):
+
+            username = username.strip()
+
+            if username:
+                result.add(username)
+
+    return result
+
+
+def get_owner_fingerprints():
+
+    result = set()
+
+    for fingerprint in owner_config.get(
+        "fingerprints",
+        []
+    ):
+
+        if isinstance(fingerprint, str):
+
+            fingerprint = fingerprint.strip()
+
+            if fingerprint:
+                result.add(fingerprint)
+
+    return result
+
+
+def is_owner_public_key(
+    username,
+    fingerprint
+):
+
+    if not username:
+        return False
+
+    if not fingerprint:
+        return False
+
+    usernames = get_owner_usernames()
+    fingerprints = get_owner_fingerprints()
+
+    return (
+        username in usernames
+        and fingerprint in fingerprints
+    )
+
+
+def print_owner_config():
+
+    usernames = sorted(
+        get_owner_usernames()
+    )
+
+    fingerprints = sorted(
+        get_owner_fingerprints()
+    )
+
+    print(
+        f"[OWNER] Config: {OWNER_CONFIG_FILE}",
+        flush=True
+    )
+
+    print(
+        f"[OWNER] Users: "
+        f"{', '.join(usernames) if usernames else 'NONE'}",
+        flush=True
+    )
+
+    print(
+        f"[OWNER] SSH fingerprints: "
+        f"{len(fingerprints)}",
+        flush=True
+    )
+
+
+# Create the owner configuration file if it does not exist.
+if not OWNER_CONFIG_FILE.exists():
+
+    save_json(
+        OWNER_CONFIG_FILE,
+        {
+            "usernames": [],
+            "fingerprints": []
+        }
+    )
+
+
+# ============================================================
 # EVENT CLEANUP
 # ============================================================
 
@@ -290,10 +448,6 @@ def cleanup_old_events():
 
     events = cleaned_events
 
-    # --------------------------------------------------------
-    # Maximum event limit
-    # --------------------------------------------------------
-
     if len(events) > MAX_EVENTS:
 
         events = events[
@@ -330,10 +484,20 @@ def create_empty_stats():
     return {
         "failed_attempts": 0,
         "successful_logins": 0,
+
+        # Current consecutive failed authentication attempts.
+        # SUCCESS resets this to 0.
+        "current_failed_streak": 0,
+
         "first_seen": now(),
         "last_seen": now(),
+
         "last_failed": None,
         "last_success": None,
+
+        "last_success_method": None,
+        "last_success_fingerprint": None,
+
         "users": []
     }
 
@@ -356,52 +520,32 @@ def normalize_stats():
         ):
 
             ip_stats[ip] = create_empty_stats()
-
             changed = True
-
             continue
 
-        if "failed_attempts" not in stats:
+        defaults = create_empty_stats()
 
-            stats["failed_attempts"] = 0
-            changed = True
+        for key, value in defaults.items():
 
-        if "successful_logins" not in stats:
+            if key not in stats:
 
-            stats["successful_logins"] = 0
-            changed = True
+                stats[key] = value
+                changed = True
 
-        if "first_seen" not in stats:
-
-            stats["first_seen"] = now()
-            changed = True
-
-        if "last_seen" not in stats:
-
-            stats["last_seen"] = now()
-            changed = True
-
-        if "last_failed" not in stats:
-
-            stats["last_failed"] = None
-            changed = True
-
-        if "last_success" not in stats:
-
-            stats["last_success"] = None
-            changed = True
-
-        if "users" not in stats:
+        if not isinstance(
+            stats.get("users"),
+            list
+        ):
 
             stats["users"] = []
             changed = True
 
         if not isinstance(
-            stats["users"],
-            list
+            stats.get("current_failed_streak"),
+            int
         ):
 
-            stats["users"] = []
+            stats["current_failed_streak"] = 0
             changed = True
 
     if changed:
@@ -412,13 +556,19 @@ def normalize_stats():
         )
 
 
+# ============================================================
+# REBUILD STATISTICS
+# ============================================================
+
 def rebuild_stats_from_events():
 
     """
-    Creates ip_stats.json from existing ssh_events.json
-    if statistics do not exist yet.
+    Rebuilds statistics from existing events.
 
-    This runs only when ip_stats.json is missing/empty.
+    IMPORTANT:
+    The current_failed_streak is calculated from the latest
+    sequence of failed/success events for each IP.
+    A successful login resets the streak.
     """
 
     global ip_stats
@@ -437,17 +587,25 @@ def rebuild_stats_from_events():
 
     new_stats = {}
 
-    for event in events:
-
-        if not isinstance(
-            event,
-            dict
-        ):
-            continue
-
-        ip = event.get(
-            "ip"
+    sorted_events = sorted(
+        [
+            event
+            for event in events
+            if isinstance(event, dict)
+        ],
+        key=lambda event: (
+            event.get("time", 0)
+            if isinstance(
+                event.get("time", 0),
+                (int, float)
+            )
+            else 0
         )
+    )
+
+    for event in sorted_events:
+
+        ip = event.get("ip")
 
         if not valid_ip(ip):
             continue
@@ -468,6 +626,7 @@ def rebuild_stats_from_events():
             event_time,
             (int, float)
         ):
+
             event_time = now()
 
         if ip not in new_stats:
@@ -475,30 +634,23 @@ def rebuild_stats_from_events():
             new_stats[ip] = {
                 "failed_attempts": 0,
                 "successful_logins": 0,
+                "current_failed_streak": 0,
                 "first_seen": event_time,
                 "last_seen": event_time,
                 "last_failed": None,
                 "last_success": None,
+                "last_success_method": None,
+                "last_success_fingerprint": None,
                 "users": []
             }
 
         stats = new_stats[ip]
 
-        # ----------------------------------------------------
-        # First/last activity
-        # ----------------------------------------------------
-
         if event_time < stats["first_seen"]:
-
             stats["first_seen"] = event_time
 
         if event_time > stats["last_seen"]:
-
             stats["last_seen"] = event_time
-
-        # ----------------------------------------------------
-        # Username
-        # ----------------------------------------------------
 
         if (
             username
@@ -510,13 +662,17 @@ def rebuild_stats_from_events():
                 username
             )
 
-        # ----------------------------------------------------
-        # Failed
-        # ----------------------------------------------------
+            if len(stats["users"]) > 20:
+
+                stats["users"] = (
+                    stats["users"][-20:]
+                )
 
         if event_type == "failed":
 
             stats["failed_attempts"] += 1
+
+            stats["current_failed_streak"] += 1
 
             if (
                 stats["last_failed"] is None
@@ -525,13 +681,13 @@ def rebuild_stats_from_events():
 
                 stats["last_failed"] = event_time
 
-        # ----------------------------------------------------
-        # Successful
-        # ----------------------------------------------------
-
         elif event_type == "success":
 
             stats["successful_logins"] += 1
+
+            # CRITICAL:
+            # A successful login ends the current failed streak.
+            stats["current_failed_streak"] = 0
 
             if (
                 stats["last_success"] is None
@@ -539,6 +695,14 @@ def rebuild_stats_from_events():
             ):
 
                 stats["last_success"] = event_time
+
+                stats["last_success_method"] = (
+                    event.get("auth_method")
+                )
+
+                stats["last_success_fingerprint"] = (
+                    event.get("fingerprint")
+                )
 
     ip_stats = new_stats
 
@@ -553,6 +717,10 @@ def rebuild_stats_from_events():
         flush=True
     )
 
+
+# ============================================================
+# OLD IP STATISTICS CLEANUP
+# ============================================================
 
 def cleanup_old_stats():
 
@@ -569,7 +737,6 @@ def cleanup_old_stats():
     )
 
     changed = False
-
     removed = 0
 
     for ip in list(
@@ -586,10 +753,8 @@ def cleanup_old_stats():
         ):
 
             del ip_stats[ip]
-
             changed = True
             removed += 1
-
             continue
 
         last_seen = stats.get(
@@ -603,25 +768,13 @@ def cleanup_old_stats():
 
             last_seen = current_time
 
-        # ----------------------------------------------------
-        # Never remove currently blocked IPs
-        # ----------------------------------------------------
-
+        # Never remove blocked IP statistics.
         if ip in blocks:
-
             continue
 
-        # ----------------------------------------------------
-        # Never remove whitelisted IPs
-        # ----------------------------------------------------
-
+        # Never remove emergency whitelist statistics.
         if ip in WHITELIST_IPS:
-
             continue
-
-        # ----------------------------------------------------
-        # Remove inactive IP statistics
-        # ----------------------------------------------------
 
         if last_seen < cutoff:
 
@@ -646,6 +799,10 @@ def cleanup_old_stats():
     return changed
 
 
+# ============================================================
+# CURRENT FAILED STREAK
+# ============================================================
+
 def get_failed_count(ip):
 
     stats = ip_stats.get(
@@ -659,50 +816,47 @@ def get_failed_count(ip):
 
         return 0
 
-    failed_attempts = stats.get(
-        "failed_attempts",
+    streak = stats.get(
+        "current_failed_streak",
         0
     )
 
     if not isinstance(
-        failed_attempts,
+        streak,
         int
     ):
 
         return 0
 
-    return failed_attempts
+    return max(
+        streak,
+        0
+    )
 
+
+# ============================================================
+# UPDATE IP STATISTICS
+# ============================================================
 
 def update_ip_stats(
     username,
     ip,
-    event_type
+    event_type,
+    auth_method=None,
+    fingerprint=None
 ):
 
     global ip_stats
 
     if ip not in ip_stats:
 
-        ip_stats[ip] = {
-            "failed_attempts": 0,
-            "successful_logins": 0,
-            "first_seen": now(),
-            "last_seen": now(),
-            "last_failed": None,
-            "last_success": None,
-            "users": []
-        }
+        ip_stats[ip] = create_empty_stats()
 
     stats = ip_stats[ip]
 
     current_time = now()
 
     stats["last_seen"] = current_time
-
-    # --------------------------------------------------------
-    # Store username
-    # --------------------------------------------------------
 
     if (
         username
@@ -714,20 +868,15 @@ def update_ip_stats(
             username
         )
 
-        # Avoid endless growth from malicious usernames.
-        #
-        # Keep only the latest 20 different usernames.
-        #
         if len(stats["users"]) > 20:
 
-            stats["users"] = stats["users"][-20:]
-
-    # --------------------------------------------------------
-    # Failed login
-    # --------------------------------------------------------
+            stats["users"] = (
+                stats["users"][-20:]
+            )
 
     if event_type == "failed":
 
+        # Total failed attempts.
         stats["failed_attempts"] = (
             stats.get(
                 "failed_attempts",
@@ -736,11 +885,16 @@ def update_ip_stats(
             + 1
         )
 
-        stats["last_failed"] = current_time
+        # Current consecutive failures.
+        stats["current_failed_streak"] = (
+            stats.get(
+                "current_failed_streak",
+                0
+            )
+            + 1
+        )
 
-    # --------------------------------------------------------
-    # Successful login
-    # --------------------------------------------------------
+        stats["last_failed"] = current_time
 
     elif event_type == "success":
 
@@ -752,7 +906,12 @@ def update_ip_stats(
             + 1
         )
 
+        # SUCCESS ALWAYS RESETS THE CURRENT STREAK.
+        stats["current_failed_streak"] = 0
+
         stats["last_success"] = current_time
+        stats["last_success_method"] = auth_method
+        stats["last_success_fingerprint"] = fingerprint
 
     save_json(
         STATS_FILE,
@@ -827,6 +986,29 @@ def ufw_unblock(ip):
 
 
 # ============================================================
+# REMOVE STORED BLOCK
+# ============================================================
+
+def remove_block(ip):
+
+    changed = False
+
+    if ip in blocks:
+
+        del blocks[ip]
+        changed = True
+
+    ufw_unblock(ip)
+
+    if changed:
+
+        save_json(
+            BLOCKS_FILE,
+            blocks
+        )
+
+
+# ============================================================
 # BLOCK LEVEL
 # ============================================================
 
@@ -834,30 +1016,14 @@ def get_block_duration(
     failed_count
 ):
 
-    # --------------------------------------------------------
-    # 21+ = permanent
-    # --------------------------------------------------------
-
     if failed_count > LEVEL_3:
         return None
-
-    # --------------------------------------------------------
-    # 20 = 2 hours
-    # --------------------------------------------------------
 
     if failed_count >= LEVEL_3:
         return BLOCK_3
 
-    # --------------------------------------------------------
-    # 10 = 20 minutes
-    # --------------------------------------------------------
-
     if failed_count >= LEVEL_2:
         return BLOCK_2
-
-    # --------------------------------------------------------
-    # 5 = 10 minutes
-    # --------------------------------------------------------
 
     if failed_count >= LEVEL_1:
         return BLOCK_1
@@ -908,21 +1074,11 @@ def block_ip(
         ip
     )
 
-    # --------------------------------------------------------
-    # Already permanently blocked
-    # --------------------------------------------------------
-
     if current and current.get(
         "permanent"
     ):
 
         return
-
-    # --------------------------------------------------------
-    # Already temporarily blocked
-    #
-    # Do NOT recreate the same UFW rule.
-    # --------------------------------------------------------
 
     if current:
 
@@ -937,10 +1093,6 @@ def block_ip(
         ):
 
             return
-
-        # ----------------------------------------------------
-        # Old temporary block
-        # ----------------------------------------------------
 
         ufw_unblock(ip)
 
@@ -970,7 +1122,8 @@ def block_ip(
 
             print(
                 f"[BLOCK] {ip} permanently blocked "
-                f"after {failed_count} failed attempts",
+                f"after {failed_count} consecutive "
+                f"failed attempts",
                 flush=True
             )
 
@@ -1024,7 +1177,8 @@ def block_ip(
         print(
             f"[BLOCK] {ip} blocked for "
             f"{duration_text} "
-            f"(attempts: {failed_count})",
+            f"(consecutive failures: "
+            f"{failed_count})",
             flush=True
         )
 
@@ -1041,10 +1195,7 @@ def cleanup_expired_blocks():
         blocks.keys()
     ):
 
-        # ----------------------------------------------------
-        # Whitelist protection
-        # ----------------------------------------------------
-
+        # Emergency whitelist protection.
         if ip in WHITELIST_IPS:
 
             ufw_unblock(ip)
@@ -1063,9 +1214,14 @@ def cleanup_expired_blocks():
 
         block = blocks[ip]
 
-        # ----------------------------------------------------
-        # Permanent blocks stay forever
-        # ----------------------------------------------------
+        if not isinstance(
+            block,
+            dict
+        ):
+
+            del blocks[ip]
+            changed = True
+            continue
 
         if block.get(
             "permanent"
@@ -1079,10 +1235,6 @@ def cleanup_expired_blocks():
 
         if expires is None:
             continue
-
-        # ----------------------------------------------------
-        # Temporary block expired
-        # ----------------------------------------------------
 
         if now() >= expires:
 
@@ -1127,7 +1279,10 @@ def save_event(
     event_type,
     username,
     ip,
-    message
+    message,
+    auth_method=None,
+    fingerprint=None,
+    owner_login=False
 ):
 
     event = {
@@ -1136,16 +1291,15 @@ def save_event(
         "type": event_type,
         "username": username,
         "ip": ip,
+        "auth_method": auth_method,
+        "fingerprint": fingerprint,
+        "owner_login": owner_login,
         "message": message
     }
 
     events.append(
         event
     )
-
-    # --------------------------------------------------------
-    # Keep only newest events
-    # --------------------------------------------------------
 
     if len(events) > MAX_EVENTS:
 
@@ -1166,34 +1320,72 @@ def save_event(
 def handle_success(
     username,
     ip,
-    message
+    message,
+    auth_method,
+    fingerprint
 ):
 
+    owner_login = is_owner_public_key(
+        username,
+        fingerprint
+    )
+
     # --------------------------------------------------------
-    # Update fast IP statistics
+    # Update statistics.
+    #
+    # SUCCESS RESETS CURRENT FAILED STREAK.
     # --------------------------------------------------------
 
     update_ip_stats(
         username,
         ip,
-        "success"
+        "success",
+        auth_method,
+        fingerprint
     )
 
     # --------------------------------------------------------
-    # Save event history
+    # Store event.
     # --------------------------------------------------------
 
     save_event(
         "success",
         username,
         ip,
-        message
+        message,
+        auth_method,
+        fingerprint,
+        owner_login
     )
+
+    # --------------------------------------------------------
+    # Owner public-key login.
+    #
+    # The owner is trusted by KEY FINGERPRINT, not by IP.
+    #
+    # If this IP was blocked from an earlier sequence and a
+    # legitimate owner key somehow succeeds, remove the block.
+    # --------------------------------------------------------
+
+    if owner_login:
+
+        print(
+            f"[OWNER LOGIN] "
+            f"user={username} "
+            f"ip={ip} "
+            f"fingerprint={fingerprint}",
+            flush=True
+        )
+
+        remove_block(ip)
+
+        return
 
     print(
         f"[SSH SUCCESS] "
         f"user={username} "
-        f"ip={ip}",
+        f"ip={ip} "
+        f"method={auth_method or 'unknown'}",
         flush=True
     )
 
@@ -1208,49 +1400,46 @@ def handle_failed(
     message
 ):
 
-    # --------------------------------------------------------
-    # Update IP statistics FIRST
-    #
-    # This replaces the old expensive full events scan.
-    # --------------------------------------------------------
-
     update_ip_stats(
         username,
         ip,
         "failed"
     )
 
-    # --------------------------------------------------------
-    # Save event history
-    # --------------------------------------------------------
-
     save_event(
         "failed",
         username,
         ip,
-        message
+        message,
+        None,
+        None,
+        False
     )
 
-    # --------------------------------------------------------
-    # Get counter directly from ip_stats.json
-    # --------------------------------------------------------
-
-    failed_count = get_failed_count(
+    failed_streak = get_failed_count(
         ip
+    )
+
+    stats = ip_stats.get(
+        ip,
+        {}
+    )
+
+    total_failed = stats.get(
+        "failed_attempts",
+        0
     )
 
     print(
         f"[SSH FAILED] "
         f"user={username} "
         f"ip={ip} "
-        f"attempts={failed_count}",
+        f"streak={failed_streak} "
+        f"total={total_failed}",
         flush=True
     )
 
-    # --------------------------------------------------------
-    # Whitelist
-    # --------------------------------------------------------
-
+    # Emergency static whitelist.
     if ip in WHITELIST_IPS:
 
         print(
@@ -1262,14 +1451,16 @@ def handle_failed(
         return
 
     # --------------------------------------------------------
-    # Block after threshold
+    # IMPORTANT:
+    # Blocking is based on CURRENT CONSECUTIVE FAILURES,
+    # not lifetime total failures.
     # --------------------------------------------------------
 
-    if failed_count >= LEVEL_1:
+    if failed_streak >= LEVEL_1:
 
         block_ip(
             ip,
-            failed_count
+            failed_streak
         )
 
 
@@ -1286,21 +1477,67 @@ FAILED_REGEX = re.compile(
 )
 
 
-ACCEPTED_REGEX = re.compile(
-    r"Accepted \S+ for "
+# Example:
+#
+# Accepted password for root from 1.2.3.4 port 12345 ssh2
+#
+ACCEPTED_PASSWORD_REGEX = re.compile(
+    r"Accepted password for "
     r"(\S+) "
     r"from "
     r"([0-9a-fA-F:.]+)"
 )
 
 
+# Example:
+#
+# Accepted publickey for root from 1.2.3.4 port 12345 ssh2:
+# ED25519 SHA256:xxxxxxxx
+#
+ACCEPTED_PUBLICKEY_REGEX = re.compile(
+    r"Accepted publickey for "
+    r"(\S+) "
+    r"from "
+    r"([0-9a-fA-F:.]+)"
+    r".*?"
+    r"ssh2(?::\s+\S+\s+)?"
+    r"(SHA256:[A-Za-z0-9+/=]+)"
+)
+
+
 def process_log_line(line):
 
     # --------------------------------------------------------
-    # SUCCESSFUL LOGIN
+    # SUCCESSFUL PUBLIC KEY LOGIN
     # --------------------------------------------------------
 
-    match = ACCEPTED_REGEX.search(
+    match = ACCEPTED_PUBLICKEY_REGEX.search(
+        line
+    )
+
+    if match:
+
+        username = match.group(1)
+        ip = match.group(2)
+        fingerprint = match.group(3)
+
+        if valid_ip(ip):
+
+            handle_success(
+                username,
+                ip,
+                line.strip(),
+                "publickey",
+                fingerprint
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # SUCCESSFUL PASSWORD LOGIN
+    # --------------------------------------------------------
+
+    match = ACCEPTED_PASSWORD_REGEX.search(
         line
     )
 
@@ -1314,7 +1551,9 @@ def process_log_line(line):
             handle_success(
                 username,
                 ip,
-                line.strip()
+                line.strip(),
+                "password",
+                None
             )
 
         return
@@ -1377,8 +1616,7 @@ def start_journal():
         ]
     ]
 
-    # Ubuntu normally uses ssh.service
-
+    # Ubuntu normally uses ssh.service.
     command = commands[0]
 
     return subprocess.Popen(
@@ -1408,6 +1646,12 @@ def print_storage_info():
 
     print(
         f"[DATA] IP statistics: {STATS_FILE}",
+        flush=True
+    )
+
+    print(
+        f"[DATA] Owner configuration: "
+        f"{OWNER_CONFIG_FILE}",
         flush=True
     )
 
@@ -1452,6 +1696,21 @@ def main():
     )
 
     print(
+        "Login tracking: SUCCESS + FAILED",
+        flush=True
+    )
+
+    print(
+        "Blocking mode: CONSECUTIVE FAILED ATTEMPTS",
+        flush=True
+    )
+
+    print(
+        "Owner protection: SSH KEY FINGERPRINT",
+        flush=True
+    )
+
+    print(
         "Password logging: DISABLED",
         flush=True
     )
@@ -1481,27 +1740,13 @@ def main():
         flush=True
     )
 
-    # --------------------------------------------------------
-    # Build statistics from existing events if necessary
-    # --------------------------------------------------------
+    print_owner_config()
 
     rebuild_stats_from_events()
 
-    # --------------------------------------------------------
-    # Normalize loaded statistics
-    # --------------------------------------------------------
-
     normalize_stats()
 
-    # --------------------------------------------------------
-    # Initial cleanup
-    # --------------------------------------------------------
-
     cleanup()
-
-    # --------------------------------------------------------
-    # Start SSH journal
-    # --------------------------------------------------------
 
     journal = start_journal()
 
@@ -1513,10 +1758,6 @@ def main():
 
             current_time = now()
 
-            # ------------------------------------------------
-            # Cleanup every minute
-            # ------------------------------------------------
-
             if (
                 current_time
                 - last_cleanup
@@ -1526,10 +1767,6 @@ def main():
                 cleanup()
 
                 last_cleanup = current_time
-
-            # ------------------------------------------------
-            # Read SSH log
-            # ------------------------------------------------
 
             line = journal.stdout.readline()
 
@@ -1562,9 +1799,7 @@ def main():
     finally:
 
         try:
-
             journal.terminate()
-
         except Exception:
             pass
 
