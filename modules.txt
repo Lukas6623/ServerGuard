@@ -1,0 +1,4 @@
+security|1.0.0|https://raw.githubusercontent.com/Lukas6623/ServerGuard/main/brute_force_guard.py|REPLACE_WITH_SHA256|/opt/serverguard/brute_force_guard.py|serverguard-security.service
+fileguard|1.0.0|https://raw.githubusercontent.com/Lukas6623/ServerGuard/main/file_guard.py|REPLACE_WITH_SHA256|/opt/serverguard/file_guard.py|serverguard-fileguard.service
+telegram|1.0.0|https://raw.githubusercontent.com/Lukas6623/ServerGuard/main/telegram_bot.py|REPLACE_WITH_SHA256|/opt/serverguard/telegram/telegram_bot.py|serverguard-telegram.service
+ssh-hardening|1.0.0|https://raw.githubusercontent.com/Lukas6623/ServerGuard/main/ssh_hardening.py|REPLACE_WITH_SHA256|/opt/serverguard/ssh_hardening.py|
