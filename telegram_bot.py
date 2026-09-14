@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 import asyncio
@@ -6,6 +5,7 @@ import html
 import json
 import os
 import time
+
 from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -21,7 +21,7 @@ from aiogram.types import Message
 # VERSION
 # ============================================================
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 
 # ============================================================
@@ -37,12 +37,26 @@ CONFIG_FILE = TELEGRAM_DIR / "telegram.conf"
 VERIFICATION_FILE = TELEGRAM_DIR / "verification.json"
 OWNER_FILE = TELEGRAM_DIR / "owner.json"
 
+# ------------------------------------------------------------
+# SSH SECURITY
+# ------------------------------------------------------------
+
 EVENTS_FILE = DATA_DIR / "ssh_events.json"
 BLOCKS_FILE = DATA_DIR / "blocked_ips.json"
 STATS_FILE = DATA_DIR / "ip_stats.json"
 
 SEEN_BLOCKS_FILE = TELEGRAM_DIR / "seen_blocks.json"
 SEEN_EVENTS_FILE = TELEGRAM_DIR / "seen_events.json"
+
+# ------------------------------------------------------------
+# FILEGUARD
+# ------------------------------------------------------------
+
+FILEGUARD_EVENTS_FILE = DATA_DIR / "file_events.json"
+
+SEEN_FILEGUARD_EVENTS_FILE = (
+    TELEGRAM_DIR / "seen_file_events.json"
+)
 
 
 # ============================================================
@@ -52,21 +66,13 @@ SEEN_EVENTS_FILE = TELEGRAM_DIR / "seen_events.json"
 CHECK_INTERVAL = 3
 
 MAX_EVENTS_TO_SHOW = 10
+
 MAX_BLOCKS_TO_SHOW = 30
+
+MAX_FILE_EVENTS_TO_SHOW = 20
 
 VERIFICATION_TIMEOUT = 10 * 60
 
-# Default timezone.
-#
-# Telegram does NOT give bots the user's timezone.
-# Therefore we use Kyiv by default.
-#
-# Owner can change it with:
-#
-# /timezone Europe/Kyiv
-# /timezone Europe/London
-# /timezone America/New_York
-#
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 
@@ -89,7 +95,10 @@ DATA_DIR.mkdir(
 # JSON HELPERS
 # ============================================================
 
-def load_json(path: Path, default):
+def load_json(
+    path: Path,
+    default
+):
 
     try:
 
@@ -113,7 +122,10 @@ def load_json(path: Path, default):
         return default
 
 
-def save_json(path: Path, data):
+def save_json(
+    path: Path,
+    data
+):
 
     try:
 
@@ -227,7 +239,10 @@ def get_owner():
     if not data.get("chat_id"):
         return None
 
-    # Add timezone automatically to old owner.json.
+    # --------------------------------------------------------
+    # Add timezone to old owner.json
+    # --------------------------------------------------------
+
     if not data.get("timezone"):
 
         data["timezone"] = DEFAULT_TIMEZONE
@@ -240,7 +255,9 @@ def get_owner():
     return data
 
 
-def is_owner(chat_id: int):
+def is_owner(
+    chat_id: int
+):
 
     owner = get_owner()
 
@@ -359,9 +376,12 @@ def format_timestamp(
 
         if include_timezone:
 
-            return dt.strftime(
-                "%d.%m.%Y %H:%M:%S"
-            ) + f" {tz_name}"
+            return (
+                dt.strftime(
+                    "%d.%m.%Y %H:%M:%S"
+                )
+                + f" {tz_name}"
+            )
 
         return dt.strftime(
             "%d.%m.%Y %H:%M:%S"
@@ -382,7 +402,6 @@ def format_iso(
 
     try:
 
-        # Prefer Unix timestamp if the value is numeric.
         timestamp = int(value)
 
         return format_timestamp(
@@ -418,9 +437,12 @@ def format_iso(
 
         if include_timezone:
 
-            return dt.strftime(
-                "%d.%m.%Y %H:%M:%S"
-            ) + f" {tz_name}"
+            return (
+                dt.strftime(
+                    "%d.%m.%Y %H:%M:%S"
+                )
+                + f" {tz_name}"
+            )
 
         return dt.strftime(
             "%d.%m.%Y %H:%M:%S"
@@ -492,7 +514,8 @@ def consume_verification(
 
     owner_data = {
 
-        "chat_id": message.chat.id,
+        "chat_id":
+            message.chat.id,
 
         "user_id":
             user.id
@@ -544,7 +567,7 @@ def consume_verification(
 
 
 # ============================================================
-# BLOCK DATA
+# SSH DATA
 # ============================================================
 
 def load_blocks():
@@ -596,10 +619,122 @@ def load_stats():
 
 
 # ============================================================
+# FILEGUARD DATA
+# ============================================================
+
+def load_file_events():
+
+    data = load_json(
+        FILEGUARD_EVENTS_FILE,
+        []
+    )
+
+    if not isinstance(
+        data,
+        list
+    ):
+        return []
+
+    return data
+
+
+def fileguard_installed():
+
+    return (
+        (BASE_DIR / "file_guard.py").exists()
+        and
+        (
+            Path(
+                "/etc/systemd/system/"
+                "serverguard-fileguard.service"
+            ).exists()
+        )
+    )
+
+
+def fileguard_service_active():
+
+    service_path = Path(
+        "/etc/systemd/system/"
+        "serverguard-fileguard.service"
+    )
+
+    if not service_path.exists():
+        return False
+
+    result = os.system(
+        "systemctl is-active "
+        "--quiet serverguard-fileguard.service "
+        "> /dev/null 2>&1"
+    )
+
+    return result == 0
+
+
+def fileguard_status():
+
+    events = load_file_events()
+
+    critical = 0
+    high = 0
+    medium = 0
+
+    for event in events:
+
+        if not isinstance(
+            event,
+            dict
+        ):
+            continue
+
+        severity = str(
+            event.get(
+                "severity",
+                ""
+            )
+        ).upper()
+
+        if severity == "CRITICAL":
+
+            critical += 1
+
+        elif severity == "HIGH":
+
+            high += 1
+
+        elif severity == "MEDIUM":
+
+            medium += 1
+
+    return {
+
+        "installed":
+            fileguard_installed(),
+
+        "active":
+            fileguard_service_active(),
+
+        "events":
+            len(events),
+
+        "critical":
+            critical,
+
+        "high":
+            high,
+
+        "medium":
+            medium
+    }
+
+
+# ============================================================
 # BLOCK STATUS
 # ============================================================
 
-def block_is_active(block):
+def block_is_active(
+    block
+):
 
     if not isinstance(
         block,
@@ -648,7 +783,7 @@ def active_blocks():
 
 
 # ============================================================
-# SECURITY STATUS
+# SSH SECURITY STATUS
 # ============================================================
 
 def security_status():
@@ -778,19 +913,12 @@ def save_seen_blocks(
 
 
 # ============================================================
-# SEEN SUCCESSFUL EVENTS
+# SEEN SSH EVENTS
 # ============================================================
 
 def event_signature(
     event
 ):
-
-    """
-    Creates a stable identifier for a SSH event.
-
-    We do not use only time because several SSH events
-    can happen within the same second.
-    """
 
     return "|".join(
         [
@@ -877,6 +1005,90 @@ def save_seen_events(
 
 
 # ============================================================
+# SEEN FILEGUARD EVENTS
+# ============================================================
+
+def fileguard_event_signature(
+    event
+):
+
+    """
+    Creates a stable identifier for a FileGuard event.
+
+    The event can safely be processed again after bot restart
+    without creating duplicate Telegram notifications.
+    """
+
+    return "|".join(
+        [
+            str(
+                event.get(
+                    "timestamp",
+                    ""
+                )
+            ),
+
+            str(
+                event.get(
+                    "time",
+                    ""
+                )
+            ),
+
+            str(
+                event.get(
+                    "path",
+                    ""
+                )
+            ),
+
+            str(
+                event.get(
+                    "event",
+                    ""
+                )
+            ),
+
+            str(
+                event.get(
+                    "severity",
+                    ""
+                )
+            )
+        ]
+    )
+
+
+def load_seen_fileguard_events():
+
+    data = load_json(
+        SEEN_FILEGUARD_EVENTS_FILE,
+        []
+    )
+
+    if not isinstance(
+        data,
+        list
+    ):
+        return set()
+
+    return set(
+        str(x)
+        for x in data
+    )
+
+
+def save_seen_fileguard_events(
+    seen
+):
+
+    return save_json(
+        SEEN_FILEGUARD_EVENTS_FILE,
+        list(seen)
+    )
+
+
+# ============================================================
 # TELEGRAM: BLOCK NOTIFICATION
 # ============================================================
 
@@ -936,15 +1148,20 @@ async def send_block_notification(
 
                 "🚨 <b>ServerGuard</b>\n\n"
 
-                "🔴 <b>IP ЗАБЛОКИРОВАН НАВСЕГДА</b>\n\n"
+                "🔴 "
+                "<b>IP ЗАБЛОКИРОВАН НАВСЕГДА</b>\n\n"
 
-                f"🌐 IP: <code>{ip_safe}</code>\n"
+                f"🌐 IP: "
+                f"<code>{ip_safe}</code>\n"
 
-                f"❌ Попыток: <b>{attempts}</b>\n"
+                f"❌ Попыток: "
+                f"<b>{attempts}</b>\n"
 
-                f"⚠️ Уровень: <b>{level}</b>\n"
+                f"⚠️ Уровень: "
+                f"<b>{level}</b>\n"
 
-                f"🕒 Время: <code>{blocked_at}</code>"
+                f"🕒 Время: "
+                f"<code>{blocked_at}</code>"
             )
 
         else:
@@ -963,16 +1180,20 @@ async def send_block_notification(
 
                 "🔒 <b>IP ЗАБЛОКИРОВАН</b>\n\n"
 
-                f"🌐 IP: <code>{ip_safe}</code>\n"
+                f"🌐 IP: "
+                f"<code>{ip_safe}</code>\n"
 
-                f"❌ Попыток: <b>{attempts}</b>\n"
+                f"❌ Попыток: "
+                f"<b>{attempts}</b>\n"
 
-                f"⚠️ Уровень: <b>{level}</b>\n"
+                f"⚠️ Уровень: "
+                f"<b>{level}</b>\n"
 
                 f"🕒 Заблокирован: "
                 f"<code>{blocked_at}</code>\n"
 
-                f"🔓 До: <code>{expires_at}</code>"
+                f"🔓 До: "
+                f"<code>{expires_at}</code>"
             )
 
         await bot.send_message(
@@ -994,7 +1215,8 @@ async def send_block_notification(
     except Exception as e:
 
         print(
-            f"[TELEGRAM] Cannot send block notification: {e}",
+            "[TELEGRAM] Cannot send block "
+            f"notification: {e}",
             flush=True
         )
 
@@ -1075,10 +1297,6 @@ async def send_success_notification(
             event_time
         )
 
-        # ----------------------------------------------------
-        # Public key
-        # ----------------------------------------------------
-
         if auth_method == "publickey":
 
             method_text = (
@@ -1094,12 +1312,10 @@ async def send_success_notification(
         else:
 
             method_text = (
-                f"🔐 <b>{html.escape(auth_method)}</b>"
+                f"🔐 <b>"
+                f"{html.escape(auth_method)}"
+                f"</b>"
             )
-
-        # ----------------------------------------------------
-        # Owner key
-        # ----------------------------------------------------
 
         if owner_login:
 
@@ -1108,7 +1324,9 @@ async def send_success_notification(
             )
 
             owner_text = (
-                "\n🛡 <b>Владелец: подтверждённый SSH-ключ</b>"
+                "\n🛡 "
+                "<b>Владелец: "
+                "подтверждённый SSH-ключ</b>"
             )
 
         else:
@@ -1128,18 +1346,16 @@ async def send_success_notification(
             f"👤 Пользователь: "
             f"<b>{username}</b>\n"
 
-            f"🌐 IP: <code>{ip}</code>\n"
+            f"🌐 IP: "
+            f"<code>{ip}</code>\n"
 
             f"{method_text}\n"
 
-            f"🕒 Время: <code>{event_time}</code>"
+            f"🕒 Время: "
+            f"<code>{event_time}</code>"
 
             f"{owner_text}"
         )
-
-        # ----------------------------------------------------
-        # Fingerprint
-        # ----------------------------------------------------
 
         if (
             auth_method == "publickey"
@@ -1184,6 +1400,203 @@ async def send_success_notification(
 
 
 # ============================================================
+# FILEGUARD NOTIFICATION
+# ============================================================
+
+async def send_fileguard_notification(
+    bot: Bot,
+    event: dict
+):
+
+    try:
+
+        owner = get_owner()
+
+        if not owner:
+            return False
+
+        path = html.escape(
+            str(
+                event.get(
+                    "path",
+                    "unknown"
+                )
+            )
+        )
+
+        event_type = html.escape(
+            str(
+                event.get(
+                    "event",
+                    "unknown"
+                )
+            )
+        )
+
+        severity = str(
+            event.get(
+                "severity",
+                "MEDIUM"
+            )
+        ).upper()
+
+        event_time = html.escape(
+            format_iso(
+                event.get(
+                    "timestamp"
+                )
+            )
+        )
+
+        # ----------------------------------------------------
+        # Severity
+        # ----------------------------------------------------
+
+        if severity == "CRITICAL":
+
+            severity_icon = "🔴"
+
+            title = (
+                "🚨 "
+                "<b>КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ ФАЙЛА</b>"
+            )
+
+        elif severity == "HIGH":
+
+            severity_icon = "🟠"
+
+            title = (
+                "⚠️ "
+                "<b>ОПАСНОЕ ИЗМЕНЕНИЕ ФАЙЛА</b>"
+            )
+
+        else:
+
+            severity_icon = "🟡"
+
+            title = (
+                "ℹ️ "
+                "<b>ИЗМЕНЕНИЕ ФАЙЛА</b>"
+            )
+
+
+        text = (
+
+            "🛡 <b>ServerGuard FileGuard</b>\n\n"
+
+            f"{severity_icon} {title}\n\n"
+
+            f"📄 Файл:\n"
+            f"<code>{path}</code>\n\n"
+
+            f"⚙️ Событие: "
+            f"<b>{event_type}</b>\n"
+
+            f"⚠️ Уровень: "
+            f"<b>{html.escape(severity)}</b>\n"
+
+            f"🕒 Время: "
+            f"<code>{event_time}</code>"
+        )
+
+
+        # ----------------------------------------------------
+        # Old state
+        # ----------------------------------------------------
+
+        old_info = event.get(
+            "old"
+        )
+
+        new_info = event.get(
+            "new"
+        )
+
+
+        if isinstance(
+            old_info,
+            dict
+        ) and isinstance(
+            new_info,
+            dict
+        ):
+
+            old_hash = old_info.get(
+                "sha256"
+            )
+
+            new_hash = new_info.get(
+                "sha256"
+            )
+
+            if (
+                old_hash
+                and
+                new_hash
+                and
+                old_hash != new_hash
+            ):
+
+                text += (
+
+                    "\n\n🔐 <b>SHA-256 изменён</b>\n"
+
+                    f"<code>{html.escape(str(old_hash))}</code>\n"
+
+                    "↓\n"
+
+                    f"<code>{html.escape(str(new_hash))}</code>"
+                )
+
+
+        # ----------------------------------------------------
+        # Special warnings
+        # ----------------------------------------------------
+
+        if path in (
+            "/etc/passwd",
+            "/etc/shadow",
+            "/etc/group",
+            "/etc/gshadow",
+            "/etc/sudoers",
+            "/etc/ssh/sshd_config"
+        ):
+
+            text += (
+                "\n\n"
+                "🛡 <b>КРИТИЧЕСКИЙ СИСТЕМНЫЙ ФАЙЛ</b>"
+            )
+
+
+        await bot.send_message(
+
+            chat_id=int(
+                owner["chat_id"]
+            ),
+
+            text=text
+        )
+
+        print(
+            "[TELEGRAM] FileGuard notification sent: "
+            f"{path}",
+            flush=True
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            "[TELEGRAM] Cannot send FileGuard "
+            f"notification: {e}",
+            flush=True
+        )
+
+        return False
+
+
+# ============================================================
 # SECURITY MONITOR
 # ============================================================
 
@@ -1200,6 +1613,11 @@ async def security_monitor(
 
     seen_events = load_seen_events()
 
+    seen_fileguard_events = (
+        load_seen_fileguard_events()
+    )
+
+
     while True:
 
         try:
@@ -1214,6 +1632,7 @@ async def security_monitor(
 
                 continue
 
+
             # ==================================================
             # NEW SUCCESSFUL SSH LOGINS
             # ==================================================
@@ -1224,6 +1643,7 @@ async def security_monitor(
 
             current_event_signatures = set()
 
+
             for event in events:
 
                 if not isinstance(
@@ -1232,7 +1652,6 @@ async def security_monitor(
                 ):
                     continue
 
-                # Only successful logins.
                 if event.get(
                     "type"
                 ) != "success":
@@ -1248,13 +1667,16 @@ async def security_monitor(
                 )
 
                 if signature in seen_events:
-
                     continue
 
-                success = await send_success_notification(
-                    bot,
-                    event
+
+                success = (
+                    await send_success_notification(
+                        bot,
+                        event
+                    )
                 )
+
 
                 if success:
 
@@ -1264,10 +1686,9 @@ async def security_monitor(
 
                     changed_events = True
 
+
             if changed_events:
 
-                # Keep only events that still exist
-                # in ssh_events.json.
                 seen_events = {
                     x
                     for x in seen_events
@@ -1278,6 +1699,7 @@ async def security_monitor(
                     seen_events
                 )
 
+
             # ==================================================
             # NEW BLOCKS
             # ==================================================
@@ -1287,6 +1709,7 @@ async def security_monitor(
             changed_blocks = False
 
             current_block_signatures = set()
+
 
             for ip, block in blocks.items():
 
@@ -1304,14 +1727,17 @@ async def security_monitor(
                 )
 
                 if signature_string in seen_blocks:
-
                     continue
 
-                success = await send_block_notification(
-                    bot,
-                    ip,
-                    block
+
+                success = (
+                    await send_block_notification(
+                        bot,
+                        ip,
+                        block
+                    )
                 )
+
 
                 if success:
 
@@ -1320,6 +1746,7 @@ async def security_monitor(
                     )
 
                     changed_blocks = True
+
 
             if changed_blocks:
 
@@ -1333,12 +1760,80 @@ async def security_monitor(
                     seen_blocks
                 )
 
+
+            # ==================================================
+            # FILEGUARD EVENTS
+            # ==================================================
+
+            file_events = load_file_events()
+
+            changed_file_events = False
+
+            current_file_signatures = set()
+
+
+            for event in file_events:
+
+                if not isinstance(
+                    event,
+                    dict
+                ):
+                    continue
+
+
+                signature = (
+                    fileguard_event_signature(
+                        event
+                    )
+                )
+
+
+                current_file_signatures.add(
+                    signature
+                )
+
+
+                if signature in seen_fileguard_events:
+                    continue
+
+
+                success = (
+                    await send_fileguard_notification(
+                        bot,
+                        event
+                    )
+                )
+
+
+                if success:
+
+                    seen_fileguard_events.add(
+                        signature
+                    )
+
+                    changed_file_events = True
+
+
+            if changed_file_events:
+
+                seen_fileguard_events = {
+                    x
+                    for x in seen_fileguard_events
+                    if x in current_file_signatures
+                }
+
+                save_seen_fileguard_events(
+                    seen_fileguard_events
+                )
+
+
         except Exception as e:
 
             print(
                 f"[MONITOR] Error: {e}",
                 flush=True
             )
+
 
         await asyncio.sleep(
             CHECK_INTERVAL
@@ -1363,13 +1858,36 @@ async def command_status(
 
         return
 
+
     status = security_status()
 
     blocks = active_blocks()
 
+    fg = fileguard_status()
+
     timezone_name = html.escape(
         get_owner_timezone()
     )
+
+
+    if fg["active"]:
+
+        fileguard_text = (
+            "🟢 ACTIVE"
+        )
+
+    elif fg["installed"]:
+
+        fileguard_text = (
+            "🟠 INSTALLED / STOPPED"
+        )
+
+    else:
+
+        fileguard_text = (
+            "⚪ NOT INSTALLED"
+        )
+
 
     text = (
 
@@ -1377,10 +1895,15 @@ async def command_status(
 
         "🟢 Защита SSH: <b>ACTIVE</b>\n"
 
+        f"🛡 FileGuard: "
+        f"<b>{fileguard_text}</b>\n"
+
         "🟢 Telegram: <b>CONNECTED</b>\n\n"
 
         f"🕒 Часовой пояс: "
         f"<code>{timezone_name}</code>\n\n"
+
+        "<b>SSH</b>\n"
 
         f"📊 Событий: "
         f"<b>{status['events']}</b>\n"
@@ -1395,11 +1918,225 @@ async def command_status(
         f"<b>{status['blocked']}</b>\n"
 
         f"📈 IP в статистике: "
-        f"<b>{status['stats']}</b>"
+        f"<b>{status['stats']}</b>\n\n"
+
+        "<b>FileGuard</b>\n"
+
+        f"📄 Событий: "
+        f"<b>{fg['events']}</b>\n"
+
+        f"🔴 Critical: "
+        f"<b>{fg['critical']}</b>\n"
+
+        f"🟠 High: "
+        f"<b>{fg['high']}</b>\n"
+
+        f"🟡 Medium: "
+        f"<b>{fg['medium']}</b>"
     )
+
 
     await message.answer(
         text
+    )
+
+
+# ============================================================
+# /FILEGUARD
+# ============================================================
+
+async def command_fileguard(
+    message: Message
+):
+
+    if not is_owner(
+        message.chat.id
+    ):
+
+        await message.answer(
+            "⛔ <b>Доступ запрещён.</b>"
+        )
+
+        return
+
+
+    fg = fileguard_status()
+
+
+    if not fg["installed"]:
+
+        await message.answer(
+
+            "🛡 <b>FileGuard</b>\n\n"
+
+            "⚪ <b>НЕ УСТАНОВЛЕН</b>\n\n"
+
+            "Установите FileGuard через "
+            "ServerGuard."
+        )
+
+        return
+
+
+    if fg["active"]:
+
+        status_text = (
+            "🟢 <b>ACTIVE / RUNNING</b>"
+        )
+
+    else:
+
+        status_text = (
+            "🔴 <b>INSTALLED / STOPPED</b>"
+        )
+
+
+    await message.answer(
+
+        "🛡 <b>ServerGuard FileGuard</b>\n\n"
+
+        f"Состояние: {status_text}\n\n"
+
+        f"📄 Всего событий: "
+        f"<b>{fg['events']}</b>\n"
+
+        f"🔴 Critical: "
+        f"<b>{fg['critical']}</b>\n"
+
+        f"🟠 High: "
+        f"<b>{fg['high']}</b>\n"
+
+        f"🟡 Medium: "
+        f"<b>{fg['medium']}</b>\n\n"
+
+        "Команда <code>/fileevents</code> "
+        "покажет последние изменения."
+    )
+
+
+# ============================================================
+# /FILEEVENTS
+# ============================================================
+
+async def command_fileevents(
+    message: Message
+):
+
+    if not is_owner(
+        message.chat.id
+    ):
+
+        await message.answer(
+            "⛔ <b>Доступ запрещён.</b>"
+        )
+
+        return
+
+
+    events = load_file_events()
+
+
+    if not events:
+
+        await message.answer(
+            "📭 <b>FileGuard событий пока нет.</b>"
+        )
+
+        return
+
+
+    events = events[
+        -MAX_FILE_EVENTS_TO_SHOW:
+    ]
+
+
+    lines = [
+        "🛡 <b>Последние FileGuard события</b>\n"
+    ]
+
+
+    for event in reversed(
+        events
+    ):
+
+        if not isinstance(
+            event,
+            dict
+        ):
+            continue
+
+
+        severity = str(
+            event.get(
+                "severity",
+                "MEDIUM"
+            )
+        ).upper()
+
+
+        if severity == "CRITICAL":
+
+            icon = "🔴"
+
+        elif severity == "HIGH":
+
+            icon = "🟠"
+
+        else:
+
+            icon = "🟡"
+
+
+        event_type = html.escape(
+            str(
+                event.get(
+                    "event",
+                    "unknown"
+                )
+            )
+        )
+
+
+        path = html.escape(
+            str(
+                event.get(
+                    "path",
+                    "unknown"
+                )
+            )
+        )
+
+
+        timestamp = event.get(
+            "timestamp"
+        )
+
+
+        time_text = html.escape(
+            format_timestamp(
+                timestamp
+            )
+        )
+
+
+        lines.append(
+
+            f"{icon} "
+            f"<code>{time_text}</code>\n"
+
+            f"   Event: "
+            f"<b>{event_type}</b>\n"
+
+            f"   Severity: "
+            f"<b>{html.escape(severity)}</b>\n"
+
+            f"   File: "
+            f"<code>{path}</code>\n"
+        )
+
+
+    await message.answer(
+        "\n".join(lines)
     )
 
 
@@ -1421,7 +2158,9 @@ async def command_blocked(
 
         return
 
+
     blocks = active_blocks()
+
 
     if not blocks:
 
@@ -1431,20 +2170,25 @@ async def command_blocked(
 
         return
 
+
     lines = [
         "🔒 <b>Заблокированные IP</b>\n"
     ]
 
+
     count = 0
+
 
     for ip, block in blocks.items():
 
         if count >= MAX_BLOCKS_TO_SHOW:
             break
 
+
         ip_safe = html.escape(
             str(ip)
         )
+
 
         attempts = html.escape(
             str(
@@ -1455,6 +2199,7 @@ async def command_blocked(
             )
         )
 
+
         level = html.escape(
             str(
                 block.get(
@@ -1464,13 +2209,18 @@ async def command_blocked(
             )
         )
 
+
         if block.get(
             "permanent"
         ):
 
             lines.append(
-                f"🔴 <code>{ip_safe}</code> — "
+
+                f"🔴 "
+                f"<code>{ip_safe}</code> — "
+
                 f"<b>PERMANENT</b> — "
+
                 f"{attempts} попыток"
             )
 
@@ -1485,12 +2235,20 @@ async def command_blocked(
             )
 
             lines.append(
-                f"🟠 <code>{ip_safe}</code> — "
+
+                f"🟠 "
+                f"<code>{ip_safe}</code> — "
+
                 f"{attempts} попыток — "
-                f"{level} — до {expires}"
+
+                f"{level} — "
+
+                f"до {expires}"
             )
 
+
         count += 1
+
 
     await message.answer(
         "\n".join(lines)
@@ -1515,7 +2273,9 @@ async def command_events(
 
         return
 
+
     events = load_events()
+
 
     if not events:
 
@@ -1525,13 +2285,16 @@ async def command_events(
 
         return
 
+
     events = events[
         -MAX_EVENTS_TO_SHOW:
     ]
 
+
     lines = [
         "📋 <b>Последние SSH события</b>\n"
     ]
+
 
     for event in reversed(
         events
@@ -1543,12 +2306,14 @@ async def command_events(
         ):
             continue
 
+
         event_type = str(
             event.get(
                 "type",
                 "unknown"
             )
         )
+
 
         username = html.escape(
             str(
@@ -1559,6 +2324,7 @@ async def command_events(
             )
         )
 
+
         ip = html.escape(
             str(
                 event.get(
@@ -1568,9 +2334,11 @@ async def command_events(
             )
         )
 
+
         timestamp = event.get(
             "time"
         )
+
 
         if timestamp:
 
@@ -1586,9 +2354,11 @@ async def command_events(
                 )
             )
 
+
         time_text = html.escape(
             time_text
         )
+
 
         if event_type == "failed":
 
@@ -1602,29 +2372,40 @@ async def command_events(
 
             icon = "ℹ️"
 
+
         auth_method = event.get(
             "auth_method"
         )
 
+
         method_text = ""
+
 
         if auth_method:
 
             method_text = (
+
                 f"\n   Method: "
-                f"<b>{html.escape(str(auth_method))}</b>"
+                f"<b>"
+                f"{html.escape(str(auth_method))}"
+                f"</b>"
             )
+
 
         lines.append(
 
-            f"{icon} <code>{time_text}</code>\n"
+            f"{icon} "
+            f"<code>{time_text}</code>\n"
 
-            f"   User: <b>{username}</b>\n"
+            f"   User: "
+            f"<b>{username}</b>\n"
 
-            f"   IP: <code>{ip}</code>"
+            f"   IP: "
+            f"<code>{ip}</code>"
 
             f"{method_text}"
         )
+
 
     await message.answer(
         "\n".join(lines)
@@ -1649,22 +2430,29 @@ async def command_ip(
 
         return
 
+
     parts = message.text.split()
+
 
     if len(parts) != 2:
 
         await message.answer(
+
             "Использование:\n"
+
             "<code>/ip 1.2.3.4</code>"
         )
 
         return
 
+
     ip = parts[1].strip()
+
 
     blocks = load_blocks()
 
     stats = load_stats()
+
 
     block = blocks.get(
         ip
@@ -1674,12 +2462,15 @@ async def command_ip(
         ip
     )
 
+
     text = (
 
         "🔎 <b>Информация об IP</b>\n\n"
 
-        f"🌐 IP: <code>{html.escape(ip)}</code>\n"
+        f"🌐 IP: "
+        f"<code>{html.escape(ip)}</code>\n"
     )
+
 
     if block and block_is_active(
         block
@@ -1690,25 +2481,32 @@ async def command_ip(
         ):
 
             text += (
-                "\n🔴 <b>ЗАБЛОКИРОВАН НАВСЕГДА</b>\n"
+                "\n🔴 "
+                "<b>ЗАБЛОКИРОВАН НАВСЕГДА</b>\n"
             )
 
         else:
 
             text += (
+
                 "\n🟠 <b>ЗАБЛОКИРОВАН</b>\n"
-                f"🔓 До: <code>"
+
+                f"🔓 До: "
+                f"<code>"
                 f"{html.escape(format_iso(block.get('expires_at_iso')))}"
                 f"</code>\n"
             )
 
+
         text += (
 
-            f"⚠️ Уровень: <b>"
+            f"⚠️ Уровень: "
+            f"<b>"
             f"{html.escape(str(block.get('level', '?')))}"
             f"</b>\n"
 
-            f"❌ Попыток: <b>"
+            f"❌ Попыток: "
+            f"<b>"
             f"{html.escape(str(block.get('failed_attempts', '?')))}"
             f"</b>"
         )
@@ -1718,6 +2516,7 @@ async def command_ip(
         text += (
             "\n🟢 <b>Сейчас не заблокирован</b>"
         )
+
 
     if isinstance(
         stat,
@@ -1739,17 +2538,21 @@ async def command_ip(
             0
         )
 
+
         text += (
 
             "\n\n📊 <b>Статистика</b>\n"
 
-            f"❌ Failed: <b>{html.escape(str(failed))}</b>\n"
+            f"❌ Failed: "
+            f"<b>{html.escape(str(failed))}</b>\n"
 
-            f"✅ Success: <b>{html.escape(str(success))}</b>\n"
+            f"✅ Success: "
+            f"<b>{html.escape(str(success))}</b>\n"
 
             f"🔥 Текущая серия ошибок: "
             f"<b>{html.escape(str(streak))}</b>"
         )
+
 
     await message.answer(
         text
@@ -1774,16 +2577,18 @@ async def command_timezone(
 
         return
 
+
     parts = message.text.split(
         maxsplit=1
     )
 
-    # /timezone
+
     if len(parts) == 1:
 
         timezone_name = html.escape(
             get_owner_timezone()
         )
+
 
         await message.answer(
 
@@ -1795,7 +2600,9 @@ async def command_timezone(
             "Чтобы изменить:\n"
 
             "<code>/timezone Europe/Kyiv</code>\n"
+
             "<code>/timezone Europe/London</code>\n"
+
             "<code>/timezone America/New_York</code>\n\n"
 
             "Используйте названия часовых поясов "
@@ -1804,7 +2611,9 @@ async def command_timezone(
 
         return
 
+
     timezone_name = parts[1].strip()
+
 
     if set_owner_timezone(
         message.chat.id,
@@ -1816,10 +2625,14 @@ async def command_timezone(
             "✅ <b>Часовой пояс изменён.</b>\n\n"
 
             f"🕒 Теперь используется:\n"
-            f"<code>{html.escape(timezone_name)}</code>\n\n"
+
+            f"<code>"
+            f"{html.escape(timezone_name)}"
+            f"</code>\n\n"
 
             "Все новые уведомления и время в "
-            "/events будут отображаться в этом часовом поясе."
+            "/events и /fileevents будут "
+            "отображаться в этом часовом поясе."
         )
 
     else:
@@ -1829,8 +2642,11 @@ async def command_timezone(
             "❌ <b>Неверный часовой пояс.</b>\n\n"
 
             "Например:\n"
+
             "<code>Europe/Kyiv</code>\n"
+
             "<code>Europe/London</code>\n"
+
             "<code>America/New_York</code>"
         )
 
@@ -1853,19 +2669,28 @@ async def command_help(
 
         return
 
+
     text = (
 
         "🛡 <b>ServerGuard</b>\n\n"
 
-        "<b>Команды:</b>\n\n"
+        "<b>SSH защита:</b>\n"
 
-        "/status — состояние защиты\n"
+        "/status — состояние всей защиты\n"
 
         "/blocked — заблокированные IP\n"
 
         "/events — последние SSH события\n"
 
-        "/ip &lt;IP&gt; — информация об IP\n"
+        "/ip &lt;IP&gt; — информация об IP\n\n"
+
+        "<b>FileGuard:</b>\n"
+
+        "/fileguard — состояние FileGuard\n"
+
+        "/fileevents — изменения файлов\n\n"
+
+        "<b>Настройки:</b>\n"
 
         "/timezone — текущий часовой пояс\n"
 
@@ -1873,6 +2698,7 @@ async def command_help(
 
         "/help — список команд"
     )
+
 
     await message.answer(
         text
@@ -1889,6 +2715,7 @@ async def command_start(
 
     chat_id = message.chat.id
 
+
     # --------------------------------------------------------
     # Already owner
     # --------------------------------------------------------
@@ -1901,13 +2728,16 @@ async def command_start(
             get_owner_timezone()
         )
 
+
         await message.answer(
 
             "🛡 <b>ServerGuard</b>\n\n"
 
-            "🟢 Вы уже зарегистрированы как владелец.\n"
+            "🟢 Вы уже зарегистрированы "
+            "как владелец.\n"
 
-            "🔔 Уведомления о безопасности включены.\n"
+            "🔔 Уведомления безопасности "
+            "включены.\n"
 
             f"🕒 Часовой пояс: "
             f"<code>{timezone_name}</code>\n\n"
@@ -1917,11 +2747,13 @@ async def command_start(
 
         return
 
+
     # --------------------------------------------------------
     # Another owner already exists
     # --------------------------------------------------------
 
     owner = get_owner()
+
 
     if owner:
 
@@ -1929,10 +2761,12 @@ async def command_start(
 
             "⛔ <b>Доступ запрещён.</b>\n\n"
 
-            "Владелец ServerGuard уже зарегистрирован."
+            "Владелец ServerGuard "
+            "уже зарегистрирован."
         )
 
         return
+
 
     # --------------------------------------------------------
     # Verification
@@ -1941,6 +2775,7 @@ async def command_start(
     parts = message.text.split(
         maxsplit=1
     )
+
 
     if len(parts) < 2:
 
@@ -1952,14 +2787,21 @@ async def command_start(
             "ввести код проверки.\n\n"
 
             "Пример:\n"
+
             "<code>/start 123456</code>"
         )
 
         return
 
+
     code = parts[1].strip()
 
-    if not code.isdigit() or len(code) != 6:
+
+    if (
+        not code.isdigit()
+        or
+        len(code) != 6
+    ):
 
         await message.answer(
 
@@ -1971,7 +2813,9 @@ async def command_start(
 
         return
 
+
     verification = get_verification()
+
 
     if not verification:
 
@@ -1979,10 +2823,12 @@ async def command_start(
 
             "❌ Код недействителен или истёк.\n\n"
 
-            "Сгенерируйте новый код в ServerGuard."
+            "Сгенерируйте новый код "
+            "в ServerGuard."
         )
 
         return
+
 
     expected_code = str(
         verification.get(
@@ -1990,6 +2836,7 @@ async def command_start(
             ""
         )
     )
+
 
     if code != expected_code:
 
@@ -2000,30 +2847,36 @@ async def command_start(
 
         return
 
+
     if not consume_verification(
         message,
         verification
     ):
 
         await message.answer(
-            "❌ Не удалось зарегистрировать владельца."
+            "❌ Не удалось "
+            "зарегистрировать владельца."
         )
 
         return
 
+
     await message.answer(
 
-        "✅ <b>Владелец успешно зарегистрирован!</b>\n\n"
+        "✅ "
+        "<b>Владелец успешно зарегистрирован!</b>\n\n"
 
         "🛡 ServerGuard подключён.\n"
 
-        "🔔 Уведомления о безопасности включены.\n"
+        "🔔 Уведомления безопасности "
+        "включены.\n"
 
         f"🕒 Часовой пояс: "
         f"<code>{DEFAULT_TIMEZONE}</code>\n\n"
 
         "Используйте /help."
     )
+
 
     print(
         f"[OWNER] Registered chat_id={chat_id}",
@@ -2053,11 +2906,13 @@ async def handle_message(
 
         return
 
+
     await message.answer(
 
         "🛡 <b>ServerGuard</b>\n\n"
 
-        "Используйте /help для списка команд."
+        "Используйте /help "
+        "для списка команд."
     )
 
 
@@ -2069,6 +2924,7 @@ async def main():
 
     token = load_config()
 
+
     if not token:
 
         print(
@@ -2079,11 +2935,13 @@ async def main():
 
         return
 
+
     print(
-        f"[BOT] Starting ServerGuard Telegram bot "
-        f"v{VERSION}...",
+        f"[BOT] Starting ServerGuard Telegram "
+        f"bot v{VERSION}...",
         flush=True
     )
+
 
     bot = Bot(
 
@@ -2094,7 +2952,9 @@ async def main():
         )
     )
 
+
     dp = Dispatcher()
+
 
     # ========================================================
     # HANDLERS
@@ -2121,6 +2981,16 @@ async def main():
     )
 
     dp.message.register(
+        command_fileguard,
+        Command("fileguard")
+    )
+
+    dp.message.register(
+        command_fileevents,
+        Command("fileevents")
+    )
+
+    dp.message.register(
         command_ip,
         Command("ip")
     )
@@ -2138,6 +3008,7 @@ async def main():
     dp.message.register(
         handle_message
     )
+
 
     # ========================================================
     # BOT TEST
@@ -2164,6 +3035,7 @@ async def main():
 
         return
 
+
     # ========================================================
     # SECURITY MONITOR
     # ========================================================
@@ -2173,6 +3045,7 @@ async def main():
             bot
         )
     )
+
 
     try:
 
@@ -2230,4 +3103,3 @@ if __name__ == "__main__":
             "[BOT] Interrupted",
             flush=True
         )
-ї
