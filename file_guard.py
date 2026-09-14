@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 import os
@@ -12,6 +11,7 @@ import ctypes.util
 import struct
 import select
 import signal
+
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -25,6 +25,11 @@ BASE_DIR = "/opt/serverguard"
 DATA_DIR = os.path.join(
     BASE_DIR,
     "data"
+)
+
+TELEGRAM_DIR = os.path.join(
+    BASE_DIR,
+    "telegram"
 )
 
 BASELINE_FILE = os.path.join(
@@ -47,10 +52,9 @@ EVENTS_FILE = os.path.join(
 # SETTINGS
 # ============================================================
 
-# Directories that should be monitored.
+# Security-sensitive directories.
 #
-# These are intentionally limited to security-sensitive
-# locations so FileGuard remains lightweight on weak VPS.
+# FileGuard monitors these directories recursively.
 #
 WATCH_DIRECTORIES = [
     "/etc/ssh",
@@ -62,11 +66,10 @@ WATCH_DIRECTORIES = [
 ]
 
 
-# Individual important files.
-#
-# These are monitored even if their parent directory is not
-# recursively available.
-#
+# ============================================================
+# PROTECTED FILES
+# ============================================================
+
 PROTECTED_FILES = [
     "/etc/passwd",
     "/etc/shadow",
@@ -78,21 +81,94 @@ PROTECTED_FILES = [
 ]
 
 
-# Maximum file size for SHA-256 calculation.
+# ============================================================
+# SERVERGUARD DYNAMIC FILES
+# ============================================================
 #
-# We don't want FileGuard to accidentally hash a multi-GB file.
+# These files are created/updated automatically by ServerGuard.
+#
+# They MUST NOT generate FileGuard events.
+#
+# This is especially important for:
+#
+#   blocked_ips.json
+#   ssh_events.json
+#   ip_stats.json
+#   file_events.json
+#
+# because these files are expected to change during normal
+# operation of the security system.
+#
+# ============================================================
+
+IGNORED_FILES = {
+    # --------------------------------------------------------
+    # SSH security data
+    # --------------------------------------------------------
+
+    "/opt/serverguard/data/blocked_ips.json",
+    "/opt/serverguard/data/ssh_events.json",
+    "/opt/serverguard/data/ip_stats.json",
+
+    # --------------------------------------------------------
+    # FileGuard internal data
+    # --------------------------------------------------------
+
+    "/opt/serverguard/data/file_events.json",
+    "/opt/serverguard/data/fileguard_baseline.json",
+    "/opt/serverguard/data/fileguard_state.json",
+
+    # --------------------------------------------------------
+    # Telegram monitor state
+    # --------------------------------------------------------
+
+    "/opt/serverguard/telegram/seen_blocks.json",
+    "/opt/serverguard/telegram/seen_events.json",
+    "/opt/serverguard/telegram/seen_file_events.json",
+
+    # --------------------------------------------------------
+    # Optional Telegram temporary/runtime files
+    # --------------------------------------------------------
+
+    "/opt/serverguard/telegram/verification.json",
+    "/opt/serverguard/telegram/owner.json",
+}
+
+
+# ============================================================
+# IGNORED DIRECTORIES
+# ============================================================
+#
+# Entire directories that contain runtime data can be ignored.
+#
+# These are checked separately from IGNORED_FILES.
+#
+# Do NOT ignore /opt/serverguard itself.
+#
+# We still want FileGuard to protect ServerGuard source files.
+#
+# ============================================================
+
+IGNORED_DIRECTORIES = {
+    "/opt/serverguard/data",
+}
+
+
+# ============================================================
+# FILE HASH SETTINGS
+# ============================================================
+
 MAX_HASH_SIZE = 50 * 1024 * 1024
 
 
-# How many events can be kept in file_events.json.
+# ============================================================
+# EVENT SETTINGS
+# ============================================================
+
 MAX_EVENTS = 1000
 
-
-# Avoid sending the exact same event repeatedly.
 EVENT_DEDUP_SECONDS = 10
 
-
-# How often state is written to disk.
 STATE_SAVE_INTERVAL = 30
 
 
@@ -118,10 +194,13 @@ IN_ACCESS = 0x00000001
 IN_MODIFY = 0x00000002
 IN_ATTRIB = 0x00000004
 IN_CLOSE_WRITE = 0x00000008
+
 IN_MOVED_FROM = 0x00000040
 IN_MOVED_TO = 0x00000080
+
 IN_CREATE = 0x00000100
 IN_DELETE = 0x00000200
+
 IN_DELETE_SELF = 0x00000400
 IN_MOVE_SELF = 0x00000800
 
@@ -143,15 +222,15 @@ WATCH_MASK = (
 )
 
 
-# Linux inotify_event structure:
+# Linux inotify_event:
 #
 # int      wd
 # uint32_t mask
 # uint32_t cookie
 # uint32_t len
 #
-# Followed by name[len]
-#
+# followed by name[len]
+
 INOTIFY_EVENT_STRUCT = struct.Struct(
     "iIII"
 )
@@ -177,16 +256,22 @@ last_events = {}
 
 last_state_save = 0
 
+libc = None
+
 
 # ============================================================
 # SIGNAL HANDLERS
 # ============================================================
 
-def signal_handler(signum, frame):
+def signal_handler(
+    signum,
+    frame
+):
     global running
 
     print(
-        "\n[FileGuard] Stopping..."
+        "\n[FileGuard] Stopping...",
+        flush=True
     )
 
     running = False
@@ -208,6 +293,7 @@ signal.signal(
 # ============================================================
 
 def ensure_data_directory():
+
     os.makedirs(
         DATA_DIR,
         mode=0o700,
@@ -220,6 +306,7 @@ def ensure_data_directory():
 # ============================================================
 
 def utc_now():
+
     return datetime.now(
         timezone.utc
     ).isoformat()
@@ -229,9 +316,16 @@ def utc_now():
 # JSON
 # ============================================================
 
-def load_json(path, default):
+def load_json(
+    path,
+    default
+):
+
     try:
-        if not os.path.exists(path):
+
+        if not os.path.exists(
+            path
+        ):
             return default
 
         with open(
@@ -239,20 +333,41 @@ def load_json(path, default):
             "r",
             encoding="utf-8"
         ) as f:
+
             return json.load(f)
 
     except Exception as e:
+
         print(
-            f"[WARNING] Failed to read {path}: {e}"
+            f"[WARNING] Failed to read "
+            f"{path}: {e}",
+            flush=True
         )
 
         return default
 
 
-def save_json(path, data):
+def save_json(
+    path,
+    data
+):
+
     temporary = path + ".tmp"
 
     try:
+
+        parent = os.path.dirname(
+            path
+        )
+
+        if parent:
+
+            os.makedirs(
+                parent,
+                mode=0o700,
+                exist_ok=True
+            )
+
         with open(
             temporary,
             "w",
@@ -281,13 +396,22 @@ def save_json(path, data):
         return True
 
     except Exception as e:
+
         print(
-            f"[ERROR] Failed to save {path}: {e}"
+            f"[ERROR] Failed to save "
+            f"{path}: {e}",
+            flush=True
         )
 
         try:
-            if os.path.exists(temporary):
-                os.remove(temporary)
+
+            if os.path.exists(
+                temporary
+            ):
+                os.remove(
+                    temporary
+                )
+
         except Exception:
             pass
 
@@ -295,17 +419,182 @@ def save_json(path, data):
 
 
 # ============================================================
+# PATH HELPERS
+# ============================================================
+
+def normalize_path(
+    path
+):
+
+    try:
+
+        return os.path.abspath(
+            os.path.normpath(
+                path
+            )
+        )
+
+    except Exception:
+
+        return str(
+            path
+        )
+
+
+def is_ignored_directory(
+    path
+):
+
+    path = normalize_path(
+        path
+    )
+
+    for directory in IGNORED_DIRECTORIES:
+
+        directory = normalize_path(
+            directory
+        )
+
+        try:
+
+            if os.path.commonpath(
+                [
+                    path,
+                    directory
+                ]
+            ) == directory:
+
+                return True
+
+        except ValueError:
+
+            pass
+
+    return False
+
+
+def is_ignored_file(
+    path
+):
+
+    path = normalize_path(
+        path
+    )
+
+    return path in {
+        normalize_path(x)
+        for x in IGNORED_FILES
+    }
+
+
+def is_ignored_path(
+    path
+):
+
+    path = normalize_path(
+        path
+    )
+
+    if is_ignored_file(
+        path
+    ):
+        return True
+
+    if is_ignored_directory(
+        path
+    ):
+        return True
+
+    return False
+
+
+# ============================================================
+# SHOULD MONITOR
+# ============================================================
+
+def is_protected_path(
+    path
+):
+
+    path = normalize_path(
+        path
+    )
+
+    # --------------------------------------------------------
+    # Dynamic ServerGuard files are NEVER monitored.
+    # --------------------------------------------------------
+
+    if is_ignored_path(
+        path
+    ):
+        return False
+
+    # --------------------------------------------------------
+    # Explicit critical files.
+    # --------------------------------------------------------
+
+    if path in PROTECTED_FILES:
+
+        return True
+
+    # --------------------------------------------------------
+    # Watched directories.
+    # --------------------------------------------------------
+
+    for directory in WATCH_DIRECTORIES:
+
+        directory = normalize_path(
+            directory
+        )
+
+        # ----------------------------------------------------
+        # Ignore runtime data directory.
+        # ----------------------------------------------------
+
+        if is_ignored_directory(
+            directory
+        ):
+            continue
+
+        try:
+
+            if os.path.commonpath(
+                [
+                    path,
+                    directory
+                ]
+            ) == directory:
+
+                return True
+
+        except ValueError:
+
+            pass
+
+    return False
+
+
+# ============================================================
 # SHA256
 # ============================================================
 
-def calculate_sha256(path):
-    try:
-        st = os.stat(path)
+def calculate_sha256(
+    path
+):
 
-        if not stat.S_ISREG(st.st_mode):
+    try:
+
+        st = os.stat(
+            path
+        )
+
+        if not stat.S_ISREG(
+            st.st_mode
+        ):
             return None
 
         if st.st_size > MAX_HASH_SIZE:
+
             return None
 
         sha256 = hashlib.sha256()
@@ -316,6 +605,7 @@ def calculate_sha256(path):
         ) as f:
 
             while True:
+
                 chunk = f.read(
                     1024 * 1024
                 )
@@ -334,6 +624,7 @@ def calculate_sha256(path):
         PermissionError,
         OSError
     ):
+
         return None
 
 
@@ -341,9 +632,27 @@ def calculate_sha256(path):
 # FILE INFORMATION
 # ============================================================
 
-def get_file_state(path):
+def get_file_state(
+    path
+):
+
+    path = normalize_path(
+        path
+    )
+
+    if is_ignored_path(
+        path
+    ):
+
+        return {
+            "ignored": True
+        }
+
     try:
-        st = os.stat(path)
+
+        st = os.stat(
+            path
+        )
 
         mode = stat.S_IMODE(
             st.st_mode
@@ -356,24 +665,43 @@ def get_file_state(path):
         sha256 = None
 
         if is_regular:
+
             sha256 = calculate_sha256(
                 path
             )
 
         return {
-            "exists": True,
-            "type": (
-                "file"
-                if is_regular
-                else "directory"
-                if stat.S_ISDIR(st.st_mode)
-                else "other"
-            ),
-            "size": st.st_size,
-            "mode": oct(mode),
-            "uid": st.st_uid,
-            "gid": st.st_gid,
-            "sha256": sha256,
+
+            "exists":
+                True,
+
+            "type":
+                (
+                    "file"
+                    if is_regular
+                    else
+                    "directory"
+                    if stat.S_ISDIR(
+                        st.st_mode
+                    )
+                    else
+                    "other"
+                ),
+
+            "size":
+                st.st_size,
+
+            "mode":
+                oct(mode),
+
+            "uid":
+                st.st_uid,
+
+            "gid":
+                st.st_gid,
+
+            "sha256":
+                sha256
         }
 
     except (
@@ -381,53 +709,34 @@ def get_file_state(path):
         PermissionError,
         OSError
     ):
+
         return {
             "exists": False
         }
 
 
 # ============================================================
-# SHOULD MONITOR
-# ============================================================
-
-def is_protected_path(path):
-    path = os.path.abspath(path)
-
-    if path in PROTECTED_FILES:
-        return True
-
-    for directory in WATCH_DIRECTORIES:
-        directory = os.path.abspath(
-            directory
-        )
-
-        try:
-            if os.path.commonpath(
-                [path, directory]
-            ) == directory:
-
-                return True
-
-        except ValueError:
-            pass
-
-    return False
-
-
-# ============================================================
 # CRITICALITY
 # ============================================================
 
-def get_severity(path, event_type):
-    path = os.path.abspath(path)
+def get_severity(
+    path,
+    event_type
+):
+
+    path = normalize_path(
+        path
+    )
 
     if path in CRITICAL_FILES:
+
         return "CRITICAL"
 
     if event_type in (
         "deleted",
         "created"
     ):
+
         if (
             path.startswith(
                 "/etc/systemd/system/"
@@ -441,6 +750,7 @@ def get_severity(path, event_type):
                 "/etc/sudoers.d/"
             )
         ):
+
             return "HIGH"
 
     if (
@@ -460,6 +770,7 @@ def get_severity(path, event_type):
             "/etc/cron.d/"
         )
     ):
+
         return "HIGH"
 
     return "MEDIUM"
@@ -469,10 +780,16 @@ def get_severity(path, event_type):
 # EVENT DEDUPLICATION
 # ============================================================
 
-def event_signature(path, event_type, state):
+def event_signature(
+    path,
+    event_type,
+    state
+):
+
     sha256 = ""
 
     if state:
+
         sha256 = state.get(
             "sha256",
             ""
@@ -481,6 +798,7 @@ def event_signature(path, event_type, state):
     mode = ""
 
     if state:
+
         mode = state.get(
             "mode",
             ""
@@ -499,6 +817,7 @@ def should_report_event(
     event_type,
     state
 ):
+
     signature = event_signature(
         path,
         event_type,
@@ -517,6 +836,7 @@ def should_report_event(
             now - previous
             < EVENT_DEDUP_SECONDS
         ):
+
             return False
 
     last_events[
@@ -537,6 +857,7 @@ def append_event(
     old_state,
     new_state
 ):
+
     events = load_json(
         EVENTS_FILE,
         []
@@ -546,15 +867,28 @@ def append_event(
         events,
         list
     ):
+
         events = []
 
     event = {
-        "timestamp": utc_now(),
-        "type": event_type,
-        "severity": severity,
-        "path": path,
-        "old_state": old_state,
-        "new_state": new_state,
+
+        "timestamp":
+            utc_now(),
+
+        "type":
+            event_type,
+
+        "severity":
+            severity,
+
+        "path":
+            path,
+
+        "old_state":
+            old_state,
+
+        "new_state":
+            new_state
     }
 
     events.append(
@@ -562,6 +896,7 @@ def append_event(
     )
 
     if len(events) > MAX_EVENTS:
+
         events = events[
             -MAX_EVENTS:
         ]
@@ -578,7 +913,10 @@ def append_event(
 # CONSOLE EVENT
 # ============================================================
 
-def print_event(event):
+def print_event(
+    event
+):
+
     severity = event.get(
         "severity",
         "UNKNOWN"
@@ -601,23 +939,28 @@ def print_event(event):
 
     print(
         "\n"
-        "=================================================="
+        "==================================================",
+        flush=True
     )
 
     print(
-        f"[FILEGUARD] {severity}"
+        f"[FILEGUARD] {severity}",
+        flush=True
     )
 
     print(
-        f"Time:   {timestamp}"
+        f"Time:   {timestamp}",
+        flush=True
     )
 
     print(
-        f"Event:  {event_type}"
+        f"Event:  {event_type}",
+        flush=True
     )
 
     print(
-        f"File:   {path}"
+        f"File:   {path}",
+        flush=True
     )
 
     old_state = event.get(
@@ -629,29 +972,36 @@ def print_event(event):
     )
 
     if old_state:
+
         print(
-            f"Old SHA256: "
-            f"{old_state.get('sha256')}"
+            "Old SHA256: "
+            f"{old_state.get('sha256')}",
+            flush=True
         )
 
         print(
-            f"Old mode:   "
-            f"{old_state.get('mode')}"
+            "Old mode:   "
+            f"{old_state.get('mode')}",
+            flush=True
         )
 
     if new_state:
+
         print(
-            f"New SHA256: "
-            f"{new_state.get('sha256')}"
+            "New SHA256: "
+            f"{new_state.get('sha256')}",
+            flush=True
         )
 
         print(
-            f"New mode:   "
-            f"{new_state.get('mode')}"
+            "New mode:   "
+            f"{new_state.get('mode')}",
+            flush=True
         )
 
     print(
-        "==================================================\n"
+        "==================================================\n",
+        flush=True
     )
 
 
@@ -663,22 +1013,36 @@ def process_file_event(
     path,
     event_type
 ):
-    path = os.path.abspath(
+
+    path = normalize_path(
         path
     )
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Ignore ServerGuard runtime files before doing anything.
+    # --------------------------------------------------------
+
+    if is_ignored_path(
+        path
+    ):
+
+        return
 
     if not is_protected_path(
         path
     ):
+
         return
 
     old_state = current_state.get(
         path
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # CREATED
-    # --------------------------------------------------------
+    # ========================================================
 
     if event_type == "created":
 
@@ -686,10 +1050,18 @@ def process_file_event(
             path
         )
 
+        if new_state.get(
+            "ignored",
+            False
+        ):
+
+            return
+
         if not new_state.get(
             "exists",
             False
         ):
+
             return
 
         if not should_report_event(
@@ -697,6 +1069,7 @@ def process_file_event(
             "created",
             new_state
         ):
+
             current_state[
                 path
             ] = new_state
@@ -726,10 +1099,9 @@ def process_file_event(
 
         return
 
-
-    # --------------------------------------------------------
+    # ========================================================
     # DELETED
-    # --------------------------------------------------------
+    # ========================================================
 
     if event_type == "deleted":
 
@@ -742,6 +1114,7 @@ def process_file_event(
             "deleted",
             new_state
         ):
+
             current_state[
                 path
             ] = new_state
@@ -771,10 +1144,9 @@ def process_file_event(
 
         return
 
-
-    # --------------------------------------------------------
-    # MODIFIED
-    # --------------------------------------------------------
+    # ========================================================
+    # MODIFIED / PERMISSIONS
+    # ========================================================
 
     if event_type in (
         "modified",
@@ -785,18 +1157,30 @@ def process_file_event(
             path
         )
 
+        if new_state.get(
+            "ignored",
+            False
+        ):
+
+            return
+
         if not new_state.get(
             "exists",
             False
         ):
-            return
 
-        # Nothing actually changed.
-        if old_state == new_state:
             return
 
         # ----------------------------------------------------
-        # Determine whether content or permissions changed.
+        # Nothing actually changed.
+        # ----------------------------------------------------
+
+        if old_state == new_state:
+
+            return
+
+        # ----------------------------------------------------
+        # Detect permission-only changes.
         # ----------------------------------------------------
 
         if (
@@ -816,22 +1200,22 @@ def process_file_event(
                 "mode"
             )
         ):
+
             event_type = (
                 "permissions_changed"
             )
-
 
         if not should_report_event(
             path,
             event_type,
             new_state
         ):
+
             current_state[
                 path
             ] = new_state
 
             return
-
 
         severity = get_severity(
             path,
@@ -862,21 +1246,29 @@ def process_file_event(
 # ============================================================
 
 def build_initial_baseline():
+
     print(
-        "[FileGuard] Building initial baseline..."
+        "[FileGuard] Building initial baseline...",
+        flush=True
     )
 
     result = {}
 
-    # --------------------------------------------------------
-    # Individual files
-    # --------------------------------------------------------
+    # ========================================================
+    # INDIVIDUAL PROTECTED FILES
+    # ========================================================
 
     for path in PROTECTED_FILES:
 
-        path = os.path.abspath(
+        path = normalize_path(
             path
         )
+
+        if is_ignored_path(
+            path
+        ):
+
+            continue
 
         state = get_file_state(
             path
@@ -886,37 +1278,75 @@ def build_initial_baseline():
             "exists",
             False
         ):
+
             result[
                 path
             ] = state
 
-
-    # --------------------------------------------------------
-    # Protected directories
-    # --------------------------------------------------------
+    # ========================================================
+    # PROTECTED DIRECTORIES
+    # ========================================================
 
     for directory in WATCH_DIRECTORIES:
+
+        directory = normalize_path(
+            directory
+        )
+
+        if is_ignored_directory(
+            directory
+        ):
+
+            print(
+                f"[FileGuard] Skipping ignored "
+                f"directory: {directory}",
+                flush=True
+            )
+
+            continue
 
         if not os.path.exists(
             directory
         ):
+
             continue
 
         try:
+
             for root, dirs, files in os.walk(
                 directory,
                 topdown=True,
                 followlinks=False
             ):
 
-                # Never follow dangerous links.
+                root = normalize_path(
+                    root
+                )
+
+                # ------------------------------------------------
+                # Completely skip ignored directories.
+                # ------------------------------------------------
+
                 dirs[:] = [
+
                     d
                     for d in dirs
-                    if not os.path.islink(
-                        os.path.join(
-                            root,
-                            d
+
+                    if (
+                        not
+                        os.path.islink(
+                            os.path.join(
+                                root,
+                                d
+                            )
+                        )
+                        and
+                        not
+                        is_ignored_directory(
+                            os.path.join(
+                                root,
+                                d
+                            )
                         )
                     )
                 ]
@@ -928,9 +1358,30 @@ def build_initial_baseline():
                         filename
                     )
 
+                    path = normalize_path(
+                        path
+                    )
+
+                    # ------------------------------------------------
+                    # Skip dynamic ServerGuard files.
+                    # ------------------------------------------------
+
+                    if is_ignored_file(
+                        path
+                    ):
+
+                        continue
+
+                    if is_ignored_directory(
+                        path
+                    ):
+
+                        continue
+
                     if os.path.islink(
                         path
                     ):
+
                         continue
 
                     state = get_file_state(
@@ -941,20 +1392,23 @@ def build_initial_baseline():
                         "exists",
                         False
                     ):
+
                         result[
-                            os.path.abspath(path)
+                            path
                         ] = state
 
         except Exception as e:
+
             print(
                 f"[WARNING] Failed to scan "
-                f"{directory}: {e}"
+                f"{directory}: {e}",
+                flush=True
             )
-
 
     print(
         f"[FileGuard] Baseline contains "
-        f"{len(result)} files."
+        f"{len(result)} files.",
+        flush=True
     )
 
     return result
@@ -965,6 +1419,7 @@ def build_initial_baseline():
 # ============================================================
 
 def initialize_baseline():
+
     global baseline
     global current_state
 
@@ -973,7 +1428,8 @@ def initialize_baseline():
     ):
 
         print(
-            "[FileGuard] Existing baseline found."
+            "[FileGuard] Existing baseline found.",
+            flush=True
         )
 
         baseline = load_json(
@@ -985,6 +1441,7 @@ def initialize_baseline():
             baseline,
             dict
         ):
+
             baseline = {}
 
     else:
@@ -996,9 +1453,46 @@ def initialize_baseline():
             baseline
         )
 
+    # --------------------------------------------------------
+    # Remove ignored files from old baselines.
+    #
+    # This is important when upgrading an existing FileGuard
+    # installation.
+    # --------------------------------------------------------
+
+    cleaned_baseline = {}
+
+    for path, state in baseline.items():
+
+        if is_ignored_path(
+            path
+        ):
+
+            continue
+
+        cleaned_baseline[
+            normalize_path(path)
+        ] = state
+
+    baseline = cleaned_baseline
 
     current_state = dict(
         baseline
+    )
+
+    # --------------------------------------------------------
+    # Save cleaned baseline.
+    # --------------------------------------------------------
+
+    save_json(
+        BASELINE_FILE,
+        baseline
+    )
+
+    print(
+        f"[FileGuard] Active baseline contains "
+        f"{len(baseline)} monitored files.",
+        flush=True
     )
 
 
@@ -1007,6 +1501,7 @@ def initialize_baseline():
 # ============================================================
 
 def load_inotify():
+
     global libc
 
     libc_name = ctypes.util.find_library(
@@ -1014,6 +1509,7 @@ def load_inotify():
     )
 
     if not libc_name:
+
         raise RuntimeError(
             "Could not find libc."
         )
@@ -1055,15 +1551,48 @@ def load_inotify():
 # ADD WATCH
 # ============================================================
 
-def add_watch(path):
+def add_watch(
+    path
+):
+
     global inotify_fd
+
+    path = normalize_path(
+        path
+    )
+
+    # --------------------------------------------------------
+    # Never watch ignored directories.
+    # --------------------------------------------------------
+
+    if is_ignored_directory(
+        path
+    ):
+
+        print(
+            f"[FileGuard] Ignoring watch: "
+            f"{path}",
+            flush=True
+        )
+
+        return
 
     if not os.path.isdir(
         path
     ):
+
+        return
+
+    # --------------------------------------------------------
+    # Avoid duplicate watches.
+    # --------------------------------------------------------
+
+    if path in descriptor_paths:
+
         return
 
     try:
+
         wd = libc.inotify_add_watch(
             inotify_fd,
             path.encode(),
@@ -1071,6 +1600,7 @@ def add_watch(path):
         )
 
         if wd < 0:
+
             return
 
         watch_descriptors[
@@ -1082,9 +1612,11 @@ def add_watch(path):
         ] = wd
 
     except Exception as e:
+
         print(
             f"[WARNING] Failed to watch "
-            f"{path}: {e}"
+            f"{path}: {e}",
+            flush=True
         )
 
 
@@ -1092,10 +1624,24 @@ def add_watch(path):
 # ADD RECURSIVE WATCHES
 # ============================================================
 
-def add_recursive_watches(directory):
+def add_recursive_watches(
+    directory
+):
+
+    directory = normalize_path(
+        directory
+    )
+
+    if is_ignored_directory(
+        directory
+    ):
+
+        return
+
     if not os.path.isdir(
         directory
     ):
+
         return
 
     add_watch(
@@ -1103,28 +1649,57 @@ def add_recursive_watches(directory):
     )
 
     try:
+
         for root, dirs, files in os.walk(
             directory,
             topdown=True,
             followlinks=False
         ):
 
-            dirs[:] = [
-                d
-                for d in dirs
-                if not os.path.islink(
-                    os.path.join(
-                        root,
-                        d
-                    )
-                )
-            ]
+            root = normalize_path(
+                root
+            )
+
+            # ------------------------------------------------
+            # Never descend into ignored directories.
+            # ------------------------------------------------
+
+            filtered_dirs = []
 
             for directory_name in dirs:
 
-                full_path = os.path.join(
-                    root,
+                full_path = normalize_path(
+                    os.path.join(
+                        root,
+                        directory_name
+                    )
+                )
+
+                if os.path.islink(
+                    full_path
+                ):
+
+                    continue
+
+                if is_ignored_directory(
+                    full_path
+                ):
+
+                    continue
+
+                filtered_dirs.append(
                     directory_name
+                )
+
+            dirs[:] = filtered_dirs
+
+            for directory_name in dirs:
+
+                full_path = normalize_path(
+                    os.path.join(
+                        root,
+                        directory_name
+                    )
                 )
 
                 add_watch(
@@ -1132,9 +1707,11 @@ def add_recursive_watches(directory):
                 )
 
     except Exception as e:
+
         print(
             f"[WARNING] Failed recursive "
-            f"watch for {directory}: {e}"
+            f"watch for {directory}: {e}",
+            flush=True
         )
 
 
@@ -1143,16 +1720,19 @@ def add_recursive_watches(directory):
 # ============================================================
 
 def initialize_inotify():
+
     global inotify_fd
 
     load_inotify()
 
     # IN_NONBLOCK = 0x800
+
     inotify_fd = libc.inotify_init1(
         0x800
     )
 
     if inotify_fd < 0:
+
         errno = ctypes.get_errno()
 
         raise RuntimeError(
@@ -1160,17 +1740,16 @@ def initialize_inotify():
             f"errno={errno}"
         )
 
-
     for directory in WATCH_DIRECTORIES:
 
         add_recursive_watches(
             directory
         )
 
-
     print(
         f"[FileGuard] Watching "
-        f"{len(watch_descriptors)} directories."
+        f"{len(watch_descriptors)} directories.",
+        flush=True
     )
 
 
@@ -1181,9 +1760,21 @@ def initialize_inotify():
 def handle_new_directory(
     path
 ):
+
+    path = normalize_path(
+        path
+    )
+
+    if is_ignored_directory(
+        path
+    ):
+
+        return
+
     if not os.path.isdir(
         path
     ):
+
         return
 
     add_recursive_watches(
@@ -1196,16 +1787,20 @@ def handle_new_directory(
 # ============================================================
 
 def read_inotify_events():
+
     try:
+
         data = os.read(
             inotify_fd,
             1024 * 1024
         )
 
     except BlockingIOError:
+
         return
 
     except OSError:
+
         return
 
     offset = 0
@@ -1214,9 +1809,9 @@ def read_inotify_events():
         data
     )
 
-
     while (
-        offset +
+        offset
+        +
         INOTIFY_EVENT_STRUCT.size
         <= data_length
     ):
@@ -1232,7 +1827,6 @@ def read_inotify_events():
             INOTIFY_EVENT_STRUCT.size
         )
 
-
         raw_name = data[
             offset:
             offset + name_length
@@ -1240,8 +1834,8 @@ def read_inotify_events():
 
         offset += name_length
 
-
         try:
+
             name = raw_name.split(
                 b"\0",
                 1
@@ -1251,38 +1845,49 @@ def read_inotify_events():
             )
 
         except Exception:
-            name = ""
 
+            name = ""
 
         directory = watch_descriptors.get(
             wd
         )
 
         if directory is None:
+
             continue
 
-
         if name:
+
             path = os.path.join(
                 directory,
                 name
             )
+
         else:
+
             path = directory
 
-
-        path = os.path.abspath(
+        path = normalize_path(
             path
         )
 
+        # ----------------------------------------------------
+        # Ignore runtime files/directories immediately.
+        # ----------------------------------------------------
+
+        if is_ignored_path(
+            path
+        ):
+
+            continue
 
         # ----------------------------------------------------
-        # Watch was removed.
+        # Watch removed.
         # ----------------------------------------------------
 
         if mask & IN_IGNORED:
-            continue
 
+            continue
 
         # ----------------------------------------------------
         # Directory created.
@@ -1294,20 +1899,23 @@ def read_inotify_events():
             mask & IN_ISDIR
         ):
 
-            handle_new_directory(
+            if not is_ignored_directory(
                 path
-            )
+            ):
+
+                handle_new_directory(
+                    path
+                )
 
             continue
-
 
         # ----------------------------------------------------
         # Directory deleted/moved.
         # ----------------------------------------------------
 
         if mask & IN_ISDIR:
-            continue
 
+            continue
 
         # ----------------------------------------------------
         # File created.
@@ -1322,7 +1930,6 @@ def read_inotify_events():
 
             continue
 
-
         # ----------------------------------------------------
         # File deleted.
         # ----------------------------------------------------
@@ -1335,7 +1942,6 @@ def read_inotify_events():
             )
 
             continue
-
 
         # ----------------------------------------------------
         # File modified.
@@ -1352,12 +1958,13 @@ def read_inotify_events():
                 "modified"
             )
 
+            continue
 
         # ----------------------------------------------------
-        # File permissions / ownership changed.
+        # Permissions / ownership changed.
         # ----------------------------------------------------
 
-        elif mask & IN_ATTRIB:
+        if mask & IN_ATTRIB:
 
             process_file_event(
                 path,
@@ -1370,11 +1977,18 @@ def read_inotify_events():
 # ============================================================
 
 def check_protected_files():
+
     for path in PROTECTED_FILES:
 
-        path = os.path.abspath(
+        path = normalize_path(
             path
         )
+
+        if is_ignored_path(
+            path
+        ):
+
+            continue
 
         old_state = current_state.get(
             path
@@ -1383,6 +1997,17 @@ def check_protected_files():
         new_state = get_file_state(
             path
         )
+
+        if new_state.get(
+            "ignored",
+            False
+        ):
+
+            continue
+
+        # ----------------------------------------------------
+        # File was not previously known.
+        # ----------------------------------------------------
 
         if old_state is None:
 
@@ -1404,6 +2029,9 @@ def check_protected_files():
 
             continue
 
+        # ----------------------------------------------------
+        # File changed.
+        # ----------------------------------------------------
 
         if old_state != new_state:
 
@@ -1430,6 +2058,7 @@ def check_protected_files():
 # ============================================================
 
 def save_state():
+
     global last_state_save
 
     now = time.time()
@@ -1438,14 +2067,62 @@ def save_state():
         now - last_state_save
         < STATE_SAVE_INTERVAL
     ):
+
         return
+
+    # --------------------------------------------------------
+    # Never save ignored files into state.
+    # --------------------------------------------------------
+
+    cleaned_state = {}
+
+    for path, state in current_state.items():
+
+        if is_ignored_path(
+            path
+        ):
+
+            continue
+
+        cleaned_state[
+            path
+        ] = state
 
     save_json(
         STATE_FILE,
-        current_state
+        cleaned_state
     )
 
     last_state_save = now
+
+
+# ============================================================
+# CLEAN OLD STATE
+# ============================================================
+
+def clean_current_state():
+
+    global current_state
+
+    cleaned = {}
+
+    for path, state in current_state.items():
+
+        path = normalize_path(
+            path
+        )
+
+        if is_ignored_path(
+            path
+        ):
+
+            continue
+
+        cleaned[
+            path
+        ] = state
+
+    current_state = cleaned
 
 
 # ============================================================
@@ -1453,7 +2130,9 @@ def save_state():
 # ============================================================
 
 def start():
+
     global running
+    global last_state_save
 
     ensure_data_directory()
 
@@ -1485,48 +2164,84 @@ def start():
         ""
     )
 
+    print(
+        "[FileGuard] Runtime ServerGuard data is ignored."
+    )
 
-    # --------------------------------------------------------
-    # Baseline
-    # --------------------------------------------------------
+    print(
+        "[FileGuard] Ignored directories:"
+    )
+
+    for directory in sorted(
+        IGNORED_DIRECTORIES
+    ):
+
+        print(
+            f"  - {directory}"
+        )
+
+    print(
+        "[FileGuard] Ignored files:"
+    )
+
+    for path in sorted(
+        IGNORED_FILES
+    ):
+
+        print(
+            f"  - {path}"
+        )
+
+    print(
+        ""
+    )
+
+    # ========================================================
+    # BASELINE
+    # ========================================================
 
     initialize_baseline()
 
+    clean_current_state()
 
-    # --------------------------------------------------------
-    # Inotify
-    # --------------------------------------------------------
+    # ========================================================
+    # INOTIFY
+    # ========================================================
 
     try:
+
         initialize_inotify()
 
     except Exception as e:
 
         print(
             f"[CRITICAL] FileGuard failed "
-            f"to initialize: {e}"
+            f"to initialize: {e}",
+            flush=True
         )
 
         return 1
 
-
     print(
-        "[OK] FileGuard is ACTIVE."
+        "[OK] FileGuard is ACTIVE.",
+        flush=True
     )
 
     print(
-        "[OK] Waiting for file system events..."
+        "[OK] Dynamic ServerGuard files are ignored.",
+        flush=True
     )
 
-
-    global last_state_save
+    print(
+        "[OK] Waiting for file system events...",
+        flush=True
+    )
 
     last_state_save = time.time()
 
-
-    # --------------------------------------------------------
-    # Main loop
-    # --------------------------------------------------------
+    # ========================================================
+    # MAIN LOOP
+    # ========================================================
 
     while running:
 
@@ -1540,16 +2255,26 @@ def start():
             )
 
             if readable:
+
                 read_inotify_events()
 
+            # ------------------------------------------------
+            # Check important individual files.
+            # ------------------------------------------------
 
-            # Check critical individual files.
             check_protected_files()
 
+            # ------------------------------------------------
+            # Clean runtime files if any old state exists.
+            # ------------------------------------------------
 
+            clean_current_state()
+
+            # ------------------------------------------------
             # Save state periodically.
-            save_state()
+            # ------------------------------------------------
 
+            save_state()
 
         except KeyboardInterrupt:
 
@@ -1558,34 +2283,40 @@ def start():
         except Exception as e:
 
             print(
-                f"[ERROR] FileGuard main loop: {e}"
+                f"[ERROR] FileGuard main loop: {e}",
+                flush=True
             )
 
-            time.sleep(2)
+            time.sleep(
+                2
+            )
 
-
-    # --------------------------------------------------------
-    # Shutdown
-    # --------------------------------------------------------
+    # ========================================================
+    # SHUTDOWN
+    # ========================================================
 
     if inotify_fd >= 0:
 
         try:
+
             os.close(
                 inotify_fd
             )
+
         except Exception:
+
             pass
 
+    clean_current_state()
 
     save_json(
         STATE_FILE,
         current_state
     )
 
-
     print(
-        "[FileGuard] Stopped."
+        "[FileGuard] Stopped.",
+        flush=True
     )
 
     return 0
@@ -1598,6 +2329,7 @@ def start():
 if __name__ == "__main__":
 
     try:
+
         sys.exit(
             start()
         )
@@ -1605,7 +2337,10 @@ if __name__ == "__main__":
     except Exception as e:
 
         print(
-            f"[CRITICAL] FileGuard crashed: {e}"
+            f"[CRITICAL] FileGuard crashed: {e}",
+            flush=True
         )
 
-        sys.exit(1)
+        sys.exit(
+            1
+        )
