@@ -1,4 +1,6 @@
-#!/usr/bin/env python3 version1
+#!/usr/bin/env python3
+# ServerGuard FileGuard
+# Version 1.1
 
 import os
 import sys
@@ -52,10 +54,6 @@ EVENTS_FILE = os.path.join(
 # SETTINGS
 # ============================================================
 
-# Security-sensitive directories.
-#
-# FileGuard monitors these directories recursively.
-#
 WATCH_DIRECTORIES = [
     "/etc/ssh",
     "/etc/sudoers.d",
@@ -89,16 +87,6 @@ PROTECTED_FILES = [
 #
 # They MUST NOT generate FileGuard events.
 #
-# This is especially important for:
-#
-#   blocked_ips.json
-#   ssh_events.json
-#   ip_stats.json
-#   file_events.json
-#
-# because these files are expected to change during normal
-# operation of the security system.
-#
 # ============================================================
 
 IGNORED_FILES = {
@@ -127,26 +115,53 @@ IGNORED_FILES = {
     "/opt/serverguard/telegram/seen_file_events.json",
 
     # --------------------------------------------------------
-    # Optional Telegram temporary/runtime files
+    # Telegram temporary/runtime files
     # --------------------------------------------------------
 
     "/opt/serverguard/telegram/verification.json",
     "/opt/serverguard/telegram/owner.json",
+
+    # --------------------------------------------------------
+    # Explicit temporary files
+    # --------------------------------------------------------
+
+    "/opt/serverguard/telegram/seen_blocks.json.tmp",
+    "/opt/serverguard/telegram/seen_events.json.tmp",
+    "/opt/serverguard/telegram/seen_file_events.json.tmp",
+    "/opt/serverguard/telegram/verification.json.tmp",
+    "/opt/serverguard/telegram/owner.json.tmp",
+}
+
+
+# ============================================================
+# IGNORED EXTENSIONS
+# ============================================================
+#
+# Temporary/editor files must never generate security events.
+#
+# This is intentionally global.
+#
+# Example:
+#
+#   seen_file_events.json.tmp
+#   test.tmp
+#   file.temp
+#   .something.swp
+#   backup.bak
+#
+# ============================================================
+
+IGNORED_EXTENSIONS = {
+    ".tmp",
+    ".temp",
+    ".swp",
+    ".swo",
+    ".bak",
 }
 
 
 # ============================================================
 # IGNORED DIRECTORIES
-# ============================================================
-#
-# Entire directories that contain runtime data can be ignored.
-#
-# These are checked separately from IGNORED_FILES.
-#
-# Do NOT ignore /opt/serverguard itself.
-#
-# We still want FileGuard to protect ServerGuard source files.
-#
 # ============================================================
 
 IGNORED_DIRECTORIES = {
@@ -441,6 +456,37 @@ def normalize_path(
         )
 
 
+# ============================================================
+# TEMPORARY FILE CHECK
+# ============================================================
+
+def is_ignored_extension(
+    path
+):
+
+    path = normalize_path(
+        path
+    )
+
+    filename = os.path.basename(
+        path
+    ).lower()
+
+    for extension in IGNORED_EXTENSIONS:
+
+        if filename.endswith(
+            extension
+        ):
+
+            return True
+
+    return False
+
+
+# ============================================================
+# IGNORED DIRECTORY
+# ============================================================
+
 def is_ignored_directory(
     path
 ):
@@ -473,6 +519,10 @@ def is_ignored_directory(
     return False
 
 
+# ============================================================
+# IGNORED FILE
+# ============================================================
+
 def is_ignored_file(
     path
 ):
@@ -481,11 +531,22 @@ def is_ignored_file(
         path
     )
 
-    return path in {
+    if is_ignored_extension(
+        path
+    ):
+        return True
+
+    normalized_ignored = {
         normalize_path(x)
         for x in IGNORED_FILES
     }
 
+    return path in normalized_ignored
+
+
+# ============================================================
+# IGNORED PATH
+# ============================================================
 
 def is_ignored_path(
     path
@@ -495,10 +556,27 @@ def is_ignored_path(
         path
     )
 
+    # --------------------------------------------------------
+    # Temporary files
+    # --------------------------------------------------------
+
+    if is_ignored_extension(
+        path
+    ):
+        return True
+
+    # --------------------------------------------------------
+    # Explicit files
+    # --------------------------------------------------------
+
     if is_ignored_file(
         path
     ):
         return True
+
+    # --------------------------------------------------------
+    # Ignored directories
+    # --------------------------------------------------------
 
     if is_ignored_directory(
         path
@@ -521,7 +599,7 @@ def is_protected_path(
     )
 
     # --------------------------------------------------------
-    # Dynamic ServerGuard files are NEVER monitored.
+    # Dynamic / temporary files are NEVER monitored.
     # --------------------------------------------------------
 
     if is_ignored_path(
@@ -546,10 +624,6 @@ def is_protected_path(
         directory = normalize_path(
             directory
         )
-
-        # ----------------------------------------------------
-        # Ignore runtime data directory.
-        # ----------------------------------------------------
 
         if is_ignored_directory(
             directory
@@ -1019,9 +1093,15 @@ def process_file_event(
     )
 
     # --------------------------------------------------------
-    # IMPORTANT:
+    # FIRST AND ABSOLUTE FILTER
+    # --------------------------------------------------------
     #
-    # Ignore ServerGuard runtime files before doing anything.
+    # Temporary files must never reach event processing.
+    #
+    # This protects against files such as:
+    #
+    # seen_file_events.json.tmp
+    #
     # --------------------------------------------------------
 
     if is_ignored_path(
@@ -1029,6 +1109,10 @@ def process_file_event(
     ):
 
         return
+
+    # --------------------------------------------------------
+    # Only protected paths.
+    # --------------------------------------------------------
 
     if not is_protected_path(
         path
@@ -1363,7 +1447,7 @@ def build_initial_baseline():
                     )
 
                     # ------------------------------------------------
-                    # Skip dynamic ServerGuard files.
+                    # Skip ignored / temporary files.
                     # ------------------------------------------------
 
                     if is_ignored_file(
@@ -1455,9 +1539,6 @@ def initialize_baseline():
 
     # --------------------------------------------------------
     # Remove ignored files from old baselines.
-    #
-    # This is important when upgrading an existing FileGuard
-    # installation.
     # --------------------------------------------------------
 
     cleaned_baseline = {}
@@ -1872,7 +1953,15 @@ def read_inotify_events():
         )
 
         # ----------------------------------------------------
-        # Ignore runtime files/directories immediately.
+        # IMPORTANT:
+        #
+        # Ignore temporary files BEFORE processing any event.
+        #
+        # This catches:
+        #
+        # seen_file_events.json.tmp
+        #
+        # before it can become "unknown".
         # ----------------------------------------------------
 
         if is_ignored_path(
@@ -2149,6 +2238,10 @@ def start():
     )
 
     print(
+        "Version: 1.1"
+    )
+
+    print(
         "Mode: lightweight / inotify"
     )
 
@@ -2166,6 +2259,22 @@ def start():
 
     print(
         "[FileGuard] Runtime ServerGuard data is ignored."
+    )
+
+    print(
+        "[FileGuard] Temporary files are ignored:"
+    )
+
+    for extension in sorted(
+        IGNORED_EXTENSIONS
+    ):
+
+        print(
+            f"  - *{extension}"
+        )
+
+    print(
+        ""
     )
 
     print(
@@ -2229,6 +2338,11 @@ def start():
 
     print(
         "[OK] Dynamic ServerGuard files are ignored.",
+        flush=True
+    )
+
+    print(
+        "[OK] Temporary files are ignored.",
         flush=True
     )
 
