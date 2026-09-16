@@ -21,7 +21,7 @@ from aiogram.types import Message
 # VERSION
 # ============================================================
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 
 
 # ============================================================
@@ -37,6 +37,7 @@ CONFIG_FILE = TELEGRAM_DIR / "telegram.conf"
 VERIFICATION_FILE = TELEGRAM_DIR / "verification.json"
 OWNER_FILE = TELEGRAM_DIR / "owner.json"
 
+
 # ------------------------------------------------------------
 # SSH SECURITY
 # ------------------------------------------------------------
@@ -47,6 +48,7 @@ STATS_FILE = DATA_DIR / "ip_stats.json"
 
 SEEN_BLOCKS_FILE = TELEGRAM_DIR / "seen_blocks.json"
 SEEN_EVENTS_FILE = TELEGRAM_DIR / "seen_events.json"
+
 
 # ------------------------------------------------------------
 # FILEGUARD
@@ -74,6 +76,41 @@ MAX_FILE_EVENTS_TO_SHOW = 20
 VERIFICATION_TIMEOUT = 10 * 60
 
 DEFAULT_TIMEZONE = "Europe/Kyiv"
+
+
+# ============================================================
+# FILEGUARD IGNORED EVENTS
+# ============================================================
+
+# This file is created temporarily by the Telegram bot itself
+# when seen_file_events.json is saved atomically.
+#
+# FileGuard can detect the temporary file and write an event
+# about it. Such an event must NOT be sent to Telegram.
+
+IGNORED_FILEGUARD_PATHS = {
+    "/opt/serverguard/telegram/seen_file_events.json.tmp"
+}
+
+
+def is_ignored_fileguard_event(
+    event: dict
+):
+
+    if not isinstance(
+        event,
+        dict
+    ):
+        return False
+
+    path = str(
+        event.get(
+            "path",
+            ""
+        )
+    ).strip()
+
+    return path in IGNORED_FILEGUARD_PATHS
 
 
 # ============================================================
@@ -687,6 +724,12 @@ def fileguard_status():
         ):
             continue
 
+        # Do not count ignored runtime event
+        if is_ignored_fileguard_event(
+            event
+        ):
+            continue
+
         severity = str(
             event.get(
                 "severity",
@@ -715,7 +758,12 @@ def fileguard_status():
             fileguard_service_active(),
 
         "events":
-            len(events),
+            sum(
+                1
+                for event in events
+                if isinstance(event, dict)
+                and not is_ignored_fileguard_event(event)
+            ),
 
         "critical":
             critical,
@@ -1410,6 +1458,23 @@ async def send_fileguard_notification(
 
     try:
 
+        # ----------------------------------------------------
+        # Safety filter
+        # ----------------------------------------------------
+
+        if is_ignored_fileguard_event(
+            event
+        ):
+
+            print(
+                "[FILEGUARD] Ignored runtime event: "
+                f"{event.get('path', 'unknown')}",
+                flush=True
+            )
+
+            return True
+
+
         owner = get_owner()
 
         if not owner:
@@ -1447,6 +1512,7 @@ async def send_fileguard_notification(
                 )
             )
         )
+
 
         # ----------------------------------------------------
         # Severity
@@ -1781,6 +1847,21 @@ async def security_monitor(
                     continue
 
 
+                # ------------------------------------------------
+                # IMPORTANT:
+                # Ignore exactly:
+                #
+                # /opt/serverguard/telegram/
+                # seen_file_events.json.tmp
+                # ------------------------------------------------
+
+                if is_ignored_fileguard_event(
+                    event
+                ):
+
+                    continue
+
+
                 signature = (
                     fileguard_event_signature(
                         event
@@ -2034,6 +2115,19 @@ async def command_fileevents(
 
 
     events = load_file_events()
+
+
+    # --------------------------------------------------------
+    # Remove ignored runtime events from display
+    # --------------------------------------------------------
+
+    events = [
+        event
+        for event in events
+        if not is_ignored_fileguard_event(
+            event
+        )
+    ]
 
 
     if not events:
