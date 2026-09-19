@@ -3,61 +3,108 @@
 import argparse
 import json
 import os
-import re
+import signal
+import socket
 import subprocess
 import sys
 import time
 
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 
 # ============================================================
-# SERVERGUARD
-# PORT & SERVICE MONITOR
+# SERVERGUARD PORT & SERVICE MONITOR
 # ============================================================
 
-VERSION = "1.0.0"
-
-
-# ============================================================
-# PATHS
-# ============================================================
+VERSION = "2.0.0"
 
 BASE_DIR = Path(
     "/opt/serverguard"
 )
 
 DATA_DIR = (
-    BASE_DIR /
-    "data"
+    BASE_DIR / "data"
+)
+
+STATE_FILE = (
+    DATA_DIR / "port_monitor_state.json"
+)
+
+PORT_EVENTS_FILE = (
+    DATA_DIR / "port_monitor_events.json"
+)
+
+NETWORK_EVENTS_FILE = (
+    DATA_DIR / "network_monitor_events.json"
+)
+
+SERVICE_EVENTS_FILE = (
+    DATA_DIR / "service_monitor_events.json"
 )
 
 BASELINE_FILE = (
-    DATA_DIR /
-    "port_service_baseline.json"
-)
-
-EVENTS_FILE = (
-    DATA_DIR /
-    "port_service_events.json"
+    DATA_DIR / "ports_baseline.json"
 )
 
 
 # ============================================================
-# SETTINGS
+# MONITOR SETTINGS
 # ============================================================
 
-MAX_EVENTS = 500
+DEFAULT_INTERVAL = 15
 
-DEFAULT_INTERVAL = 30
+MAX_EVENTS = 2000
+
+MAX_NETWORK_EVENTS = 2000
+
+MAX_SERVICE_EVENTS = 2000
+
+MAX_CONNECTIONS_TO_STORE = 5000
+
+
+# ============================================================
+# GLOBAL STATE
+# ============================================================
+
+running = True
+
+
+# ============================================================
+# SIGNAL HANDLERS
+# ============================================================
+
+def signal_handler(
+    signum,
+    frame
+):
+    global running
+
+    running = False
+
+    print(
+        "[MONITOR] Stopping...",
+        flush=True
+    )
+
+
+signal.signal(
+    signal.SIGTERM,
+    signal_handler
+)
+
+signal.signal(
+    signal.SIGINT,
+    signal_handler
+)
 
 
 # ============================================================
 # DIRECTORIES
 # ============================================================
 
-def ensure_directories():
+def create_directories():
+
     DATA_DIR.mkdir(
         parents=True,
         exist_ok=True
@@ -65,17 +112,36 @@ def ensure_directories():
 
 
 # ============================================================
-# JSON LOAD
+# TIME
+# ============================================================
+
+def now():
+
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+
+def local_time():
+
+    return datetime.now().astimezone().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+# ============================================================
+# JSON
 # ============================================================
 
 def load_json(
-    path: Path,
-    default: Any
-) -> Any:
+    path,
+    default
+):
 
     try:
 
         if not path.exists():
+
             return default
 
         with path.open(
@@ -83,32 +149,32 @@ def load_json(
             encoding="utf-8"
         ) as file:
 
-            return json.load(
+            data = json.load(
                 file
             )
 
-    except Exception:
+        return data
+
+    except Exception as error:
+
+        print(
+            f"[ERROR] Cannot load {path}: {error}",
+            flush=True
+        )
 
         return default
 
 
-# ============================================================
-# JSON SAVE
-# ============================================================
-
 def save_json(
-    path: Path,
-    data: Any
-) -> bool:
+    path,
+    data
+):
+
+    temporary = path.with_suffix(
+        ".tmp"
+    )
 
     try:
-
-        ensure_directories()
-
-        temporary = path.with_suffix(
-            path.suffix +
-            ".tmp"
-        )
 
         with temporary.open(
             "w",
@@ -122,10 +188,8 @@ def save_json(
                 ensure_ascii=False
             )
 
-            file.flush()
-
-            os.fsync(
-                file.fileno()
+            file.write(
+                "\n"
             )
 
         os.replace(
@@ -138,11 +202,58 @@ def save_json(
     except Exception as error:
 
         print(
-            f"Save error: {error}",
-            file=sys.stderr
+            f"[ERROR] Cannot save {path}: {error}",
+            flush=True
         )
 
+        try:
+
+            if temporary.exists():
+
+                temporary.unlink()
+
+        except Exception:
+            pass
+
         return False
+
+
+# ============================================================
+# EVENTS
+# ============================================================
+
+def append_event(
+    path,
+    event,
+    maximum
+):
+
+    events = load_json(
+        path,
+        []
+    )
+
+    if not isinstance(
+        events,
+        list
+    ):
+
+        events = []
+
+    events.append(
+        event
+    )
+
+    if len(events) > maximum:
+
+        events = events[
+            -maximum:
+        ]
+
+    save_json(
+        path,
+        events
+    )
 
 
 # ============================================================
@@ -150,9 +261,9 @@ def save_json(
 # ============================================================
 
 def run_command(
-    command: List[str],
-    timeout: int = 15
-) -> tuple[int, str]:
+    command,
+    timeout=10
+):
 
     try:
 
@@ -161,136 +272,50 @@ def run_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
-            check=False
+            timeout=timeout
         )
 
         return (
             result.returncode,
-            result.stdout.strip()
+            result.stdout,
+            result.stderr
         )
 
-    except Exception:
+    except Exception as error:
 
         return (
             -1,
-            ""
+            "",
+            str(error)
         )
 
 
 # ============================================================
-# UID
+# COMMAND EXISTS
 # ============================================================
 
-def get_username(
-    uid: str
-) -> str:
+def command_exists(
+    command
+):
 
-    try:
-
-        result = subprocess.run(
-            [
-                "getent",
-                "passwd",
-                uid
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5
-        )
-
-        if result.returncode != 0:
-            return ""
-
-        line = result.stdout.strip()
-
-        if not line:
-            return ""
-
-        return line.split(
-            ":",
-            1
-        )[0]
-
-    except Exception:
-
-        return ""
-
-
-# ============================================================
-# PROCESS
-# ============================================================
-
-def parse_process(
-    text: str
-) -> Dict[str, str]:
-
-    result = {
-        "process": "",
-        "pid": "",
-        "user": ""
-    }
-
-
-    if not text:
-        return result
-
-
-    process_match = re.search(
-        r'\(\("([^"]+)"',
-        text
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            f"command -v {command} >/dev/null 2>&1"
+        ]
     )
 
-
-    if process_match:
-
-        result[
-            "process"
-        ] = process_match.group(1)
-
-
-    pid_match = re.search(
-        r"pid=(\d+)",
-        text
-    )
-
-
-    if pid_match:
-
-        result[
-            "pid"
-        ] = pid_match.group(1)
-
-
-    uid_match = re.search(
-        r"uid=(\d+)",
-        text
-    )
-
-
-    if uid_match:
-
-        result[
-            "user"
-        ] = get_username(
-            uid_match.group(1)
-        )
-
-
-    return result
+    return result.returncode == 0
 
 
 # ============================================================
-# ADDRESS
+# PORT INFORMATION
 # ============================================================
 
 def parse_address(
-    address: str
-) -> tuple[str, int]:
-
-    address = address.strip()
-
+    address
+):
 
     if not address:
 
@@ -299,38 +324,23 @@ def parse_address(
             0
         )
 
+    address = address.strip()
 
-    # --------------------------------------------------------
-    # IPv6
-    # --------------------------------------------------------
-
+    # IPv6:
+    # [::]:22
     if address.startswith("["):
 
-        closing = address.rfind(
-            "]"
-        )
-
+        closing = address.rfind("]")
 
         if closing != -1:
 
             host = address[
-                1:
-                closing
+                1:closing
             ]
 
             port_text = address[
-                closing + 1:
+                closing + 2:
             ]
-
-
-            if port_text.startswith(
-                ":"
-            ):
-
-                port_text = (
-                    port_text[1:]
-                )
-
 
             try:
 
@@ -346,24 +356,20 @@ def parse_address(
                     0
                 )
 
-
-    # --------------------------------------------------------
-    # IPv4 / wildcard
-    # --------------------------------------------------------
-
+    # IPv4:
+    # 0.0.0.0:22
     if ":" in address:
 
-        host, port = address.rsplit(
+        host, port_text = address.rsplit(
             ":",
             1
         )
-
 
         try:
 
             return (
                 host,
-                int(port)
+                int(port_text)
             )
 
         except ValueError:
@@ -373,7 +379,6 @@ def parse_address(
                 0
             )
 
-
     return (
         address,
         0
@@ -381,243 +386,636 @@ def parse_address(
 
 
 # ============================================================
-# SS LINE
-# ============================================================
-
-def parse_ss_line(
-    line: str
-) -> Optional[Dict[str, Any]]:
-
-    line = line.strip()
-
-
-    if not line:
-        return None
-
-
-    if line.startswith(
-        "Netid"
-    ):
-        return None
-
-
-    parts = line.split()
-
-
-    if len(parts) < 5:
-        return None
-
-
-    protocol = (
-        parts[0]
-        .lower()
-    )
-
-
-    state = (
-        parts[1]
-        .upper()
-    )
-
-
-    local_address = (
-        parts[4]
-    )
-
-
-    peer_address = ""
-
-
-    if len(parts) >= 6:
-
-        peer_address = (
-            parts[5]
-        )
-
-
-    process_text = ""
-
-
-    users_index = line.find(
-        "users:("
-    )
-
-
-    if users_index != -1:
-
-        process_text = line[
-            users_index:
-        ]
-
-
-    process = parse_process(
-        process_text
-    )
-
-
-    host, port = parse_address(
-        local_address
-    )
-
-
-    if port <= 0:
-
-        return None
-
-
-    return {
-        "protocol": protocol,
-        "state": state,
-        "address": local_address,
-        "host": host,
-        "port": port,
-        "peer": peer_address,
-        "process": process["process"],
-        "pid": process["pid"],
-        "user": process["user"]
-    }
-
-
-# ============================================================
 # LISTENING PORTS
 # ============================================================
 
-def get_ports() -> List[Dict[str, Any]]:
-
-    commands = [
-        [
-            "ss",
-            "-H",
-            "-O",
-            "-n",
-            "-l",
-            "-t",
-            "-u",
-            "-p"
-        ],
-        [
-            "ss",
-            "-H",
-            "-n",
-            "-l",
-            "-t",
-            "-u",
-            "-p"
-        ]
-    ]
-
-
-    output = ""
-
-
-    for command in commands:
-
-        code, result = run_command(
-            command
-        )
-
-
-        if code == 0 and result:
-
-            output = result
-
-            break
-
-
-    if not output:
-
-        return []
-
+def scan_listening_ports():
 
     ports = []
 
+    command = [
+        "ss",
+        "-lntup",
+        "-H"
+    ]
+
+    return_code, output, error = run_command(
+        command
+    )
+
+    if return_code != 0:
+
+        print(
+            f"[ERROR] ss failed: {error.strip()}",
+            flush=True
+        )
+
+        return ports
 
     for line in output.splitlines():
 
-        item = parse_ss_line(
-            line
-        )
+        line = line.strip()
 
+        if not line:
 
-        if item is None:
             continue
 
+        parts = line.split()
+
+        if len(parts) < 5:
+
+            continue
+
+        protocol = parts[0]
+
+        local_address = parts[4]
+
+        host, port = parse_address(
+            local_address
+        )
+
+        if port <= 0:
+
+            continue
+
+        process_name = ""
+
+        pid = 0
+
+        username = ""
+
+        process_info = ""
+
+        if len(parts) >= 7:
+
+            process_info = " ".join(
+                parts[6:]
+            )
+
+        if process_info:
+
+            # users:(("sshd",pid=1234,fd=3))
+            if '(" ' in process_info:
+                pass
+
+            marker = '("'
+
+            position = process_info.find(
+                marker
+            )
+
+            if position != -1:
+
+                start = position + 2
+
+                end = process_info.find(
+                    '"',
+                    start
+                )
+
+                if end != -1:
+
+                    process_name = process_info[
+                        start:end
+                    ]
+
+            pid_marker = "pid="
+
+            pid_position = process_info.find(
+                pid_marker
+            )
+
+            if pid_position != -1:
+
+                pid_start = (
+                    pid_position
+                    + len(pid_marker)
+                )
+
+                pid_end = process_info.find(
+                    ",",
+                    pid_start
+                )
+
+                if pid_end == -1:
+
+                    pid_end = process_info.find(
+                        ")",
+                        pid_start
+                    )
+
+                if pid_end != -1:
+
+                    pid_text = process_info[
+                        pid_start:pid_end
+                    ]
+
+                    try:
+
+                        pid = int(
+                            pid_text
+                        )
+
+                    except ValueError:
+
+                        pid = 0
+
+        if pid > 0:
+
+            username = get_process_user(
+                pid
+            )
+
+            if not process_name:
+
+                process_name = get_process_name(
+                    pid
+                )
+
+        service = ""
+
+        if pid > 0:
+
+            service = get_process_service(
+                pid
+            )
+
+        if not service and process_name:
+
+            service = guess_service(
+                process_name
+            )
+
+        item = {
+            "protocol": protocol,
+            "address": host,
+            "port": port,
+            "process": process_name,
+            "pid": pid,
+            "user": username,
+            "service": service
+        }
 
         ports.append(
             item
         )
 
-
     ports.sort(
         key=lambda item: (
-            item["protocol"],
-            item["port"],
-            item["address"]
+            item.get("port", 0),
+            item.get("protocol", "")
         )
     )
-
 
     return ports
 
 
 # ============================================================
-# PORT SECURITY KEY
+# PROCESS INFORMATION
 # ============================================================
 
-def port_key(
-    item: Dict[str, Any]
-) -> tuple:
+def get_process_user(
+    pid
+):
 
-    return (
-        item.get(
-            "protocol",
-            ""
-        ),
-        item.get(
-            "address",
-            ""
-        ),
-        int(
-            item.get(
-                "port",
-                0
-            )
+    try:
+
+        path = Path(
+            f"/proc/{pid}/status"
         )
+
+        if not path.exists():
+
+            return ""
+
+        uid = None
+
+        with path.open(
+            "r",
+            encoding="utf-8",
+            errors="ignore"
+        ) as file:
+
+            for line in file:
+
+                if line.startswith(
+                    "Uid:"
+                ):
+
+                    parts = line.split()
+
+                    if len(parts) >= 2:
+
+                        uid = int(
+                            parts[1]
+                        )
+
+                    break
+
+        if uid is None:
+
+            return ""
+
+        return subprocess.check_output(
+            [
+                "getent",
+                "passwd",
+                str(uid)
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL
+        ).split(
+            ":",
+            1
+        )[0]
+
+    except Exception:
+
+        return ""
+
+
+def get_process_name(
+    pid
+):
+
+    try:
+
+        path = Path(
+            f"/proc/{pid}/comm"
+        )
+
+        if path.exists():
+
+            return path.read_text(
+                encoding="utf-8",
+                errors="ignore"
+            ).strip()
+
+    except Exception:
+        pass
+
+    return ""
+
+
+def get_process_service(
+    pid
+):
+
+    try:
+
+        cgroup_path = Path(
+            f"/proc/{pid}/cgroup"
+        )
+
+        if not cgroup_path.exists():
+
+            return ""
+
+        content = cgroup_path.read_text(
+            encoding="utf-8",
+            errors="ignore"
+        )
+
+        for line in content.splitlines():
+
+            if "system.slice" not in line:
+
+                continue
+
+            value = line.split(
+                ":",
+                2
+            )
+
+            if len(value) != 3:
+
+                continue
+
+            group = value[2]
+
+            if group.endswith(
+                ".service"
+            ):
+
+                service = group.split(
+                    "/"
+                )[-1]
+
+                return service
+
+    except Exception:
+        pass
+
+    return ""
+
+
+# ============================================================
+# SERVICE GUESS
+# ============================================================
+
+def guess_service(
+    process_name
+):
+
+    known = {
+        "sshd": "ssh",
+        "nginx": "nginx",
+        "apache2": "apache2",
+        "mysqld": "mysql",
+        "mariadbd": "mariadb",
+        "postgres": "postgresql",
+        "redis-server": "redis",
+        "docker-proxy": "docker",
+        "containerd": "containerd",
+        "cupsd": "cups",
+        "named": "named",
+        "dnsmasq": "dnsmasq",
+        "vsftpd": "vsftpd"
+    }
+
+    return known.get(
+        process_name,
+        ""
     )
 
 
 # ============================================================
-# NORMAL PORT
+# NETWORK CONNECTIONS
 # ============================================================
 
-def normalized_port(
-    item: Dict[str, Any]
-) -> Dict[str, Any]:
+def scan_network_connections():
+
+    connections = []
+
+    return_code, output, error = run_command(
+        [
+            "ss",
+            "-ntup",
+            "-H"
+        ]
+    )
+
+    if return_code != 0:
+
+        return connections
+
+    for line in output.splitlines():
+
+        line = line.strip()
+
+        if not line:
+
+            continue
+
+        parts = line.split()
+
+        if len(parts) < 5:
+
+            continue
+
+        protocol = parts[0]
+
+        state = parts[1]
+
+        local_address = parts[4]
+
+        remote_address = parts[5]
+
+        local_host, local_port = parse_address(
+            local_address
+        )
+
+        remote_host, remote_port = parse_address(
+            remote_address
+        )
+
+        process_name = ""
+
+        pid = 0
+
+        process_info = ""
+
+        if len(parts) >= 7:
+
+            process_info = " ".join(
+                parts[6:]
+            )
+
+        marker = '("'
+
+        position = process_info.find(
+            marker
+        )
+
+        if position != -1:
+
+            start = position + 2
+
+            end = process_info.find(
+                '"',
+                start
+            )
+
+            if end != -1:
+
+                process_name = process_info[
+                    start:end
+                ]
+
+        pid_marker = "pid="
+
+        pid_position = process_info.find(
+            pid_marker
+        )
+
+        if pid_position != -1:
+
+            pid_start = (
+                pid_position
+                + len(pid_marker)
+            )
+
+            pid_end = process_info.find(
+                ",",
+                pid_start
+            )
+
+            if pid_end == -1:
+
+                pid_end = process_info.find(
+                    ")",
+                    pid_start
+                )
+
+            if pid_end != -1:
+
+                try:
+
+                    pid = int(
+                        process_info[
+                            pid_start:pid_end
+                        ]
+                    )
+
+                except ValueError:
+
+                    pid = 0
+
+        username = ""
+
+        if pid > 0:
+
+            username = get_process_user(
+                pid
+            )
+
+        item = {
+            "protocol": protocol,
+            "state": state,
+            "local_address": local_host,
+            "local_port": local_port,
+            "remote_address": remote_host,
+            "remote_port": remote_port,
+            "process": process_name,
+            "pid": pid,
+            "user": username
+        }
+
+        connections.append(
+            item
+        )
+
+    if len(connections) > MAX_CONNECTIONS_TO_STORE:
+
+        connections = connections[
+            :MAX_CONNECTIONS_TO_STORE
+        ]
+
+    return connections
+
+
+# ============================================================
+# CONNECTION KEY
+# ============================================================
+
+def connection_key(
+    connection
+):
+
+    return (
+        connection.get("protocol", ""),
+        connection.get("local_address", ""),
+        connection.get("local_port", 0),
+        connection.get("remote_address", ""),
+        connection.get("remote_port", 0),
+        connection.get("process", ""),
+        connection.get("pid", 0)
+    )
+
+
+# ============================================================
+# PORT KEY
+# ============================================================
+
+def port_key(
+    port
+):
+
+    return (
+        port.get("protocol", ""),
+        port.get("address", ""),
+        port.get("port", 0)
+    )
+
+
+# ============================================================
+# PORT EVENT
+# ============================================================
+
+def create_port_event(
+    event_type,
+    port
+):
 
     return {
-        "protocol": item.get(
+        "time": now(),
+        "event": event_type,
+        "protocol": port.get(
             "protocol",
             ""
         ),
-        "address": item.get(
+        "address": port.get(
             "address",
             ""
         ),
-        "host": item.get(
-            "host",
-            ""
+        "port": port.get(
+            "port",
+            0
         ),
-        "port": int(
-            item.get(
-                "port",
-                0
-            )
-        ),
-        "process": item.get(
+        "process": port.get(
             "process",
             ""
         ),
-        "user": item.get(
+        "pid": port.get(
+            "pid",
+            0
+        ),
+        "user": port.get(
+            "user",
+            ""
+        ),
+        "service": port.get(
+            "service",
+            ""
+        )
+    }
+
+
+# ============================================================
+# CONNECTION EVENT
+# ============================================================
+
+def create_connection_event(
+    event_type,
+    connection
+):
+
+    return {
+        "time": now(),
+        "event": event_type,
+        "protocol": connection.get(
+            "protocol",
+            ""
+        ),
+        "state": connection.get(
+            "state",
+            ""
+        ),
+        "local_address": connection.get(
+            "local_address",
+            ""
+        ),
+        "local_port": connection.get(
+            "local_port",
+            0
+        ),
+        "remote_address": connection.get(
+            "remote_address",
+            ""
+        ),
+        "remote_port": connection.get(
+            "remote_port",
+            0
+        ),
+        "process": connection.get(
+            "process",
+            ""
+        ),
+        "pid": connection.get(
+            "pid",
+            0
+        ),
+        "user": connection.get(
             "user",
             ""
         )
@@ -625,332 +1023,252 @@ def normalized_port(
 
 
 # ============================================================
-# SERVICES
-# ============================================================
-
-def get_services() -> List[str]:
-
-    code, output = run_command(
-        [
-            "systemctl",
-            "list-units",
-            "--type=service",
-            "--state=running",
-            "--no-pager",
-            "--no-legend"
-        ]
-    )
-
-
-    if code != 0:
-
-        return []
-
-
-    result = []
-
-
-    for line in output.splitlines():
-
-        parts = line.split()
-
-
-        if not parts:
-            continue
-
-
-        name = parts[0]
-
-
-        if name.endswith(
-            ".service"
-        ):
-
-            result.append(
-                name
-            )
-
-
-    return sorted(
-        set(result)
-    )
-
-
-# ============================================================
-# FAILED SERVICES
-# ============================================================
-
-def get_failed_services() -> List[str]:
-
-    code, output = run_command(
-        [
-            "systemctl",
-            "list-units",
-            "--type=service",
-            "--state=failed",
-            "--no-pager",
-            "--no-legend"
-        ]
-    )
-
-
-    if code != 0:
-
-        return []
-
-
-    result = []
-
-
-    for line in output.splitlines():
-
-        parts = line.split()
-
-
-        if not parts:
-            continue
-
-
-        name = parts[0]
-
-
-        if name.endswith(
-            ".service"
-        ):
-
-            result.append(
-                name
-            )
-
-
-    return sorted(
-        set(result)
-    )
-
-
-# ============================================================
-# SNAPSHOT
-# ============================================================
-
-def create_snapshot() -> Dict[str, Any]:
-
-    ports = [
-        normalized_port(
-            item
-        )
-        for item in get_ports()
-    ]
-
-
-    ports.sort(
-        key=lambda item: (
-            item["protocol"],
-            item["address"],
-            item["port"],
-            item["process"],
-            item["user"]
-        )
-    )
-
-
-    services = get_services()
-
-    failed_services = (
-        get_failed_services()
-    )
-
-
-    return {
-        "version": VERSION,
-        "timestamp": int(
-            time.time()
-        ),
-        "ports": ports,
-        "services": services,
-        "failed_services": failed_services
-    }
-
-
-# ============================================================
-# BASELINE
-# ============================================================
-
-def create_baseline() -> Dict[str, Any]:
-
-    snapshot = (
-        create_snapshot()
-    )
-
-
-    if not save_json(
-        BASELINE_FILE,
-        snapshot
-    ):
-
-        raise RuntimeError(
-            "Cannot save baseline."
-        )
-
-
-    return snapshot
-
-
-def load_baseline() -> Optional[Dict[str, Any]]:
-
-    data = load_json(
-        BASELINE_FILE,
-        None
-    )
-
-
-    if not isinstance(
-        data,
-        dict
-    ):
-
-        return None
-
-
-    return data
-
-
-# ============================================================
-# EVENTS
-# ============================================================
-
-def load_events() -> List[Dict[str, Any]]:
-
-    data = load_json(
-        EVENTS_FILE,
-        []
-    )
-
-
-    if not isinstance(
-        data,
-        list
-    ):
-
-        return []
-
-
-    return data
-
-
-def add_event(
-    event_type: str,
-    data: Dict[str, Any]
-):
-
-    events = load_events()
-
-
-    events.append(
-        {
-            "timestamp": int(
-                time.time()
-            ),
-            "type": event_type,
-            "data": data
-        }
-    )
-
-
-    if len(events) > MAX_EVENTS:
-
-        events = events[
-            -MAX_EVENTS:
-        ]
-
-
-    save_json(
-        EVENTS_FILE,
-        events
-    )
-
-
-# ============================================================
 # COMPARE PORTS
 # ============================================================
 
 def compare_ports(
-    old_ports: List[Dict[str, Any]],
-    new_ports: List[Dict[str, Any]]
-) -> Dict[str, Any]:
+    old_ports,
+    new_ports,
+    initial=False
+):
 
     old_map = {
         port_key(item): item
         for item in old_ports
     }
 
-
     new_map = {
         port_key(item): item
         for item in new_ports
     }
 
+    if initial:
 
-    added = []
+        return
 
-    removed = []
-
-    changed = []
-
-
-    # --------------------------------------------------------
-    # NEW
-    # --------------------------------------------------------
-
-    for key, item in new_map.items():
+    for key, port in new_map.items():
 
         if key not in old_map:
 
-            added.append(
-                item
+            event = create_port_event(
+                "new_port",
+                port
             )
 
-            continue
-
-
-        old = old_map[key]
-
-
-        if (
-            old.get("process", "")
-            !=
-            item.get("process", "")
-            or
-            old.get("user", "")
-            !=
-            item.get("user", "")
-        ):
-
-            changed.append(
-                {
-                    "old": old,
-                    "new": item
-                }
+            append_event(
+                PORT_EVENTS_FILE,
+                event,
+                MAX_EVENTS
             )
 
+            print(
+                format_port_event(
+                    event
+                ),
+                flush=True
+            )
 
-    # --------------------------------------------------------
-    # REMOVED
-    # --------------------------------------------------------
-
-    for key, item in old_map.items():
+    for key, port in old_map.items():
 
         if key not in new_map:
 
-            removed.append(
-                item
+            event = create_port_event(
+                "port_closed",
+                port
+            )
+
+            append_event(
+                PORT_EVENTS_FILE,
+                event,
+                MAX_EVENTS
+            )
+
+            print(
+                format_port_event(
+                    event
+                ),
+                flush=True
+            )
+
+    # --------------------------------------------------------
+    # Process changed
+    # --------------------------------------------------------
+
+    common_keys = (
+        set(old_map.keys())
+        & set(new_map.keys())
+    )
+
+    for key in common_keys:
+
+        old_port = old_map[key]
+
+        new_port = new_map[key]
+
+        old_process = (
+            old_port.get(
+                "process",
+                ""
+            ),
+            old_port.get(
+                "pid",
+                0
+            )
+        )
+
+        new_process = (
+            new_port.get(
+                "process",
+                ""
+            ),
+            new_port.get(
+                "pid",
+                0
+            )
+        )
+
+        if old_process != new_process:
+
+            event = create_port_event(
+                "port_process_changed",
+                new_port
+            )
+
+            event["previous_process"] = old_port.get(
+                "process",
+                ""
+            )
+
+            event["previous_pid"] = old_port.get(
+                "pid",
+                0
+            )
+
+            append_event(
+                PORT_EVENTS_FILE,
+                event,
+                MAX_EVENTS
+            )
+
+            print(
+                format_port_event(
+                    event
+                ),
+                flush=True
             )
 
 
-    return {
-        "added": added,
-        "removed": removed,
-        "changed": changed
+# ============================================================
+# COMPARE CONNECTIONS
+# ============================================================
+
+def compare_connections(
+    old_connections,
+    new_connections,
+    initial=False
+):
+
+    old_map = {
+        connection_key(item): item
+        for item in old_connections
     }
+
+    new_map = {
+        connection_key(item): item
+        for item in new_connections
+    }
+
+    if initial:
+
+        return
+
+    for key, connection in new_map.items():
+
+        if key not in old_map:
+
+            event = create_connection_event(
+                "new_connection",
+                connection
+            )
+
+            append_event(
+                NETWORK_EVENTS_FILE,
+                event,
+                MAX_NETWORK_EVENTS
+            )
+
+            print(
+                format_connection_event(
+                    event
+                ),
+                flush=True
+            )
+
+    for key, connection in old_map.items():
+
+        if key not in new_map:
+
+            event = create_connection_event(
+                "connection_closed",
+                connection
+            )
+
+            append_event(
+                NETWORK_EVENTS_FILE,
+                event,
+                MAX_NETWORK_EVENTS
+            )
+
+
+# ============================================================
+# SERVICE STATUS
+# ============================================================
+
+def get_services():
+
+    services = {}
+
+    return_code, output, error = run_command(
+        [
+            "systemctl",
+            "list-units",
+            "--type=service",
+            "--all",
+            "--no-legend",
+            "--no-pager"
+        ]
+    )
+
+    if return_code != 0:
+
+        return services
+
+    for line in output.splitlines():
+
+        parts = line.split()
+
+        if len(parts) < 4:
+
+            continue
+
+        unit = parts[0]
+
+        active = parts[2]
+
+        sub = parts[3]
+
+        if not unit.endswith(
+            ".service"
+        ):
+
+            continue
+
+        services[unit] = {
+            "active": active,
+            "sub": sub
+        }
+
+    return services
 
 
 # ============================================================
@@ -958,304 +1276,365 @@ def compare_ports(
 # ============================================================
 
 def compare_services(
-    old_services: List[str],
-    new_services: List[str]
-) -> Dict[str, List[str]]:
+    old_services,
+    new_services,
+    initial=False
+):
 
-    old_set = set(
-        old_services
+    if initial:
+
+        return
+
+    all_names = (
+        set(old_services.keys())
+        | set(new_services.keys())
     )
 
-    new_set = set(
-        new_services
-    )
+    for name in all_names:
 
-
-    return {
-        "added": sorted(
-            new_set - old_set
-        ),
-        "removed": sorted(
-            old_set - new_set
+        old = old_services.get(
+            name
         )
-    }
 
+        new = new_services.get(
+            name
+        )
 
-# ============================================================
-# CHECK
-# ============================================================
+        if old == new:
 
-def check_baseline() -> Dict[str, Any]:
+            continue
 
-    baseline = load_baseline()
+        if old is None and new is not None:
 
+            event_type = "service_started"
 
-    if baseline is None:
+        elif old is not None and new is None:
 
-        return {
-            "status": "NO_BASELINE",
-            "ports": {
-                "added": [],
-                "removed": [],
-                "changed": []
-            },
-            "services": {
-                "added": [],
-                "removed": []
-            },
-            "failed_services": []
+            event_type = "service_removed"
+
+        else:
+
+            event_type = "service_changed"
+
+        event = {
+            "time": now(),
+            "event": event_type,
+            "service": name,
+            "previous": old,
+            "current": new
         }
 
-
-    current = create_snapshot()
-
-
-    port_changes = compare_ports(
-        baseline.get(
-            "ports",
-            []
-        ),
-        current.get(
-            "ports",
-            []
+        append_event(
+            SERVICE_EVENTS_FILE,
+            event,
+            MAX_SERVICE_EVENTS
         )
+
+        print(
+            format_service_event(
+                event
+            ),
+            flush=True
+        )
+
+
+# ============================================================
+# FORMAT PORT EVENT
+# ============================================================
+
+def format_port_event(
+    event
+):
+
+    event_type = event.get(
+        "event",
+        ""
+    )
+
+    if event_type == "new_port":
+
+        title = "NEW PORT"
+
+    elif event_type == "port_closed":
+
+        title = "PORT CLOSED"
+
+    else:
+
+        title = "PORT PROCESS CHANGED"
+
+    return (
+        f"[{title}] "
+        f"{event.get('protocol', '')} "
+        f"{event.get('address', '')}:"
+        f"{event.get('port', 0)} "
+        f"process={event.get('process', '')} "
+        f"pid={event.get('pid', 0)} "
+        f"user={event.get('user', '')} "
+        f"service={event.get('service', '')}"
     )
 
 
-    service_changes = compare_services(
-        baseline.get(
-            "services",
-            []
-        ),
-        current.get(
-            "services",
-            []
-        )
+# ============================================================
+# FORMAT CONNECTION EVENT
+# ============================================================
+
+def format_connection_event(
+    event
+):
+
+    return (
+        "[NEW CONNECTION] "
+        f"{event.get('protocol', '')} "
+        f"{event.get('remote_address', '')}:"
+        f"{event.get('remote_port', 0)} -> "
+        f"{event.get('local_address', '')}:"
+        f"{event.get('local_port', 0)} "
+        f"state={event.get('state', '')} "
+        f"process={event.get('process', '')} "
+        f"pid={event.get('pid', 0)} "
+        f"user={event.get('user', '')}"
     )
 
 
-    failed_services = (
-        current.get(
-            "failed_services",
-            []
-        )
+# ============================================================
+# FORMAT SERVICE EVENT
+# ============================================================
+
+def format_service_event(
+    event
+):
+
+    return (
+        f"[SERVICE] "
+        f"{event.get('event', '')} "
+        f"{event.get('service', '')}"
     )
 
 
-    changed = (
-        bool(
-            port_changes["added"]
-        )
-        or
-        bool(
-            port_changes["removed"]
-        )
-        or
-        bool(
-            port_changes["changed"]
-        )
-        or
-        bool(
-            service_changes["added"]
-        )
-        or
-        bool(
-            service_changes["removed"]
-        )
-        or
-        bool(
-            failed_services
-        )
-    )
+# ============================================================
+# SAVE STATE
+# ============================================================
 
+def save_state(
+    ports,
+    connections,
+    services
+):
 
-    result = {
-        "status":
-            "CHANGED"
-            if changed
-            else "OK",
-
-        "ports":
-            port_changes,
-
-        "services":
-            service_changes,
-
-        "failed_services":
-            failed_services,
-
-        "current":
-            current
+    state = {
+        "version": VERSION,
+        "updated": now(),
+        "ports": ports,
+        "connections": connections,
+        "services": services
     }
 
-
-    # --------------------------------------------------------
-    # EVENTS
-    # --------------------------------------------------------
-
-    for item in port_changes[
-        "added"
-    ]:
-
-        add_event(
-            "PORT_ADDED",
-            item
-        )
-
-
-    for item in port_changes[
-        "removed"
-    ]:
-
-        add_event(
-            "PORT_REMOVED",
-            item
-        )
-
-
-    for item in port_changes[
-        "changed"
-    ]:
-
-        add_event(
-            "PORT_PROCESS_CHANGED",
-            item
-        )
-
-
-    for service in service_changes[
-        "added"
-    ]:
-
-        add_event(
-            "SERVICE_ADDED",
-            {
-                "service": service
-            }
-        )
-
-
-    for service in service_changes[
-        "removed"
-    ]:
-
-        add_event(
-            "SERVICE_REMOVED",
-            {
-                "service": service
-            }
-        )
-
-
-    return result
+    return save_json(
+        STATE_FILE,
+        state
+    )
 
 
 # ============================================================
-# FORMAT PORT
+# LOAD STATE
 # ============================================================
 
-def format_port(
-    item: Dict[str, Any]
-) -> str:
+def load_state():
 
-    protocol = str(
-        item.get(
-            "protocol",
-            ""
-        )
-    ).upper()
-
-
-    address = item.get(
-        "address",
-        ""
+    state = load_json(
+        STATE_FILE,
+        {}
     )
 
+    if not isinstance(
+        state,
+        dict
+    ):
 
-    port = item.get(
-        "port",
-        0
-    )
+        state = {}
 
-
-    process = item.get(
-        "process",
-        ""
-    )
-
-
-    pid = item.get(
-        "pid",
-        ""
-    )
-
-
-    user = item.get(
-        "user",
-        ""
-    )
-
-
-    result = (
-        f"{protocol} "
-        f"{address} "
-        f"port={port}"
-    )
-
-
-    if process:
-
-        result += (
-            f" | process={process}"
-        )
-
-
-    if pid:
-
-        result += (
-            f" | pid={pid}"
-        )
-
-
-    if user:
-
-        result += (
-            f" | user={user}"
-        )
-
-
-    return result
+    return state
 
 
 # ============================================================
-# SCAN OUTPUT
+# BASELINE
 # ============================================================
 
-def command_scan():
+def create_baseline():
 
-    ports = get_ports()
+    create_directories()
+
+    ports = scan_listening_ports()
+
+    baseline = {
+        "created": now(),
+        "ports": ports
+    }
+
+    if save_json(
+        BASELINE_FILE,
+        baseline
+    ):
+
+        print(
+            "Port baseline created.",
+            flush=True
+        )
+
+        print(
+            f"Ports: {len(ports)}",
+            flush=True
+        )
+
+        return 0
+
+    return 1
 
 
-    print()
-    print(
-        "============================================"
+def check_baseline():
+
+    baseline = load_json(
+        BASELINE_FILE,
+        {}
     )
-    print(
-        "       SERVERGUARD PORT MONITOR"
-    )
-    print(
-        "============================================"
-    )
-    print()
 
+    if not isinstance(
+        baseline,
+        dict
+    ):
 
-    print(
-        f"Listening ports: {len(ports)}"
+        print(
+            "Baseline is not available.",
+            flush=True
+        )
+
+        return 1
+
+    old_ports = baseline.get(
+        "ports",
+        []
     )
 
+    if not isinstance(
+        old_ports,
+        list
+    ):
+
+        old_ports = []
+
+    current_ports = scan_listening_ports()
+
+    old_map = {
+        port_key(item): item
+        for item in old_ports
+    }
+
+    current_map = {
+        port_key(item): item
+        for item in current_ports
+    }
+
+    added = [
+        item
+        for key, item in current_map.items()
+        if key not in old_map
+    ]
+
+    removed = [
+        item
+        for key, item in old_map.items()
+        if key not in current_map
+    ]
+
+    print(
+        "========================================"
+    )
+
+    print(
+        "        PORT BASELINE CHECK"
+    )
+
+    print(
+        "========================================"
+    )
 
     print()
 
+    print(
+        f"Baseline ports: {len(old_ports)}"
+    )
+
+    print(
+        f"Current ports:  {len(current_ports)}"
+    )
+
+    print()
+
+    if not added and not removed:
+
+        print(
+            "No port changes detected."
+        )
+
+        return 0
+
+    if added:
+
+        print(
+            "NEW PORTS:"
+        )
+
+        for item in added:
+
+            print(
+                f"  {item.get('protocol')} "
+                f"{item.get('address')}:"
+                f"{item.get('port')} "
+                f"{item.get('process', '')}"
+            )
+
+    if removed:
+
+        print()
+
+        print(
+            "CLOSED PORTS:"
+        )
+
+        for item in removed:
+
+            print(
+                f"  {item.get('protocol')} "
+                f"{item.get('address')}:"
+                f"{item.get('port')} "
+                f"{item.get('process', '')}"
+            )
+
+    return 0
+
+
+# ============================================================
+# SHOW PORTS
+# ============================================================
+
+def show_ports():
+
+    ports = scan_listening_ports()
+
+    print(
+        "========================================"
+    )
+
+    print(
+        "          LISTENING PORTS"
+    )
+
+    print(
+        "========================================"
+    )
+
+    print()
 
     if not ports:
 
@@ -1265,79 +1644,23 @@ def command_scan():
 
         return 0
 
-
     for item in ports:
 
         print(
-            " - " +
-            format_port(
-                item
-            )
+            f"{item.get('protocol', ''):<6} "
+            f"{item.get('address', '')}:"
+            f"{item.get('port', 0):<6} "
+            f"process={item.get('process', '-'):<20} "
+            f"pid={item.get('pid', 0):<7} "
+            f"user={item.get('user', '-'):<15} "
+            f"service={item.get('service', '-')}"
         )
 
-
     print()
-
-    return 0
-
-
-# ============================================================
-# SERVICES OUTPUT
-# ============================================================
-
-def command_services():
-
-    services = get_services()
-
-    failed = get_failed_services()
-
-
-    print()
-    print(
-        "============================================"
-    )
-    print(
-        "       SERVERGUARD SERVICES"
-    )
-    print(
-        "============================================"
-    )
-    print()
-
 
     print(
-        f"Running services: {len(services)}"
+        f"Total: {len(ports)}"
     )
-
-
-    print()
-
-
-    for service in services:
-
-        print(
-            " - " +
-            service
-        )
-
-
-    print()
-
-
-    print(
-        f"Failed services: {len(failed)}"
-    )
-
-
-    for service in failed:
-
-        print(
-            " - FAILED: " +
-            service
-        )
-
-
-    print()
 
     return 0
 
@@ -1346,28 +1669,37 @@ def command_services():
 # PORT DETAILS
 # ============================================================
 
-def command_port(
-    port: int
+def show_port(
+    port
 ):
 
-    ports = get_ports()
+    ports = scan_listening_ports()
 
+    found = []
 
-    found = [
-        item
-        for item in ports
+    for item in ports:
+
         if item.get(
             "port"
-        ) == port
-    ]
+        ) == port:
 
+            found.append(
+                item
+            )
 
-    print()
     print(
-        f"Port details: {port}"
+        "========================================"
     )
-    print()
 
+    print(
+        f"          PORT {port}"
+    )
+
+    print(
+        "========================================"
+    )
+
+    print()
 
     if not found:
 
@@ -1377,377 +1709,200 @@ def command_port(
 
         return 0
 
-
     for item in found:
 
         print(
-            format_port(
-                item
-            )
+            f"Protocol: {item.get('protocol')}"
         )
 
+        print(
+            f"Address:  {item.get('address')}"
+        )
+
+        print(
+            f"Port:     {item.get('port')}"
+        )
+
+        print(
+            f"Process:  {item.get('process') or '-'}"
+        )
+
+        print(
+            f"PID:      {item.get('pid') or '-'}"
+        )
+
+        print(
+            f"User:     {item.get('user') or '-'}"
+        )
+
+        print(
+            f"Service:  {item.get('service') or '-'}"
+        )
+
+        print()
 
     return 0
 
 
 # ============================================================
-# BASELINE OUTPUT
+# SERVICES
 # ============================================================
 
-def command_baseline():
+def show_services():
 
-    snapshot = (
-        create_baseline()
-    )
-
-
-    print()
-    print(
-        "============================================"
-    )
-    print(
-        "       SECURITY BASELINE CREATED"
-    )
-    print(
-        "============================================"
-    )
-    print()
-
+    services = get_services()
 
     print(
-        f"Ports: "
-        f"{len(snapshot['ports'])}"
+        "========================================"
     )
-
 
     print(
-        f"Services: "
-        f"{len(snapshot['services'])}"
+        "          RUNNING SERVICES"
     )
-
 
     print(
-        f"Failed services: "
-        f"{len(snapshot['failed_services'])}"
+        "========================================"
     )
-
 
     print()
 
+    running_services = []
+
+    for name, status in services.items():
+
+        if (
+            status.get("active") == "active"
+            and
+            status.get("sub") == "running"
+        ):
+
+            running_services.append(
+                name
+            )
+
+    running_services.sort()
+
+    for service in running_services:
+
+        print(
+            f"RUNNING  {service}"
+        )
+
+    print()
 
     print(
-        "Baseline:"
+        f"Running services: "
+        f"{len(running_services)}"
     )
-
-
-    print(
-        BASELINE_FILE
-    )
-
 
     return 0
-
-
-# ============================================================
-# CHECK OUTPUT
-# ============================================================
-
-def command_check():
-
-    result = check_baseline()
-
-
-    print()
-    print(
-        "============================================"
-    )
-    print(
-        "       SECURITY BASELINE CHECK"
-    )
-    print(
-        "============================================"
-    )
-    print()
-
-
-    if result[
-        "status"
-    ] == "NO_BASELINE":
-
-        print(
-            "Baseline does not exist."
-        )
-
-        print(
-            "Create it first with:"
-        )
-
-        print(
-            "baseline"
-        )
-
-        return 1
-
-
-    if result[
-        "status"
-    ] == "OK":
-
-        print(
-            "STATUS: OK"
-        )
-
-        print(
-            "No changes detected."
-        )
-
-        return 0
-
-
-    print(
-        "STATUS: CHANGED"
-    )
-
-
-    print()
-
-
-    added = result[
-        "ports"
-    ]["added"]
-
-
-    removed = result[
-        "ports"
-    ]["removed"]
-
-
-    changed = result[
-        "ports"
-    ]["changed"]
-
-
-    if added:
-
-        print(
-            "NEW PORTS:"
-        )
-
-
-        for item in added:
-
-            print(
-                " + " +
-                format_port(
-                    item
-                )
-            )
-
-
-        print()
-
-
-    if removed:
-
-        print(
-            "REMOVED PORTS:"
-        )
-
-
-        for item in removed:
-
-            print(
-                " - " +
-                format_port(
-                    item
-                )
-            )
-
-
-        print()
-
-
-    if changed:
-
-        print(
-            "CHANGED PROCESSES:"
-        )
-
-
-        for item in changed:
-
-            print(
-                " OLD: " +
-                format_port(
-                    item["old"]
-                )
-            )
-
-
-            print(
-                " NEW: " +
-                format_port(
-                    item["new"]
-                )
-            )
-
-
-        print()
-
-
-    service_changes = (
-        result[
-            "services"
-        ]
-    )
-
-
-    if service_changes[
-        "added"
-    ]:
-
-        print(
-            "NEW SERVICES:"
-        )
-
-
-        for service in service_changes[
-            "added"
-        ]:
-
-            print(
-                " + " +
-                service
-            )
-
-
-        print()
-
-
-    if service_changes[
-        "removed"
-    ]:
-
-        print(
-            "REMOVED SERVICES:"
-        )
-
-
-        for service in service_changes[
-            "removed"
-        ]:
-
-            print(
-                " - " +
-                service
-            )
-
-
-        print()
-
-
-    failed = result[
-        "failed_services"
-    ]
-
-
-    if failed:
-
-        print(
-            "FAILED SERVICES:"
-        )
-
-
-        for service in failed:
-
-            print(
-                " ! " +
-                service
-            )
-
-
-    return 2
 
 
 # ============================================================
 # EVENTS
 # ============================================================
 
-def command_events():
+def show_events(
+    event_type="all",
+    count=50
+):
 
-    events = load_events()
+    if event_type == "ports":
 
+        files = [
+            (
+                "PORT EVENTS",
+                PORT_EVENTS_FILE
+            )
+        ]
 
-    print()
-    print(
-        "============================================"
-    )
-    print(
-        "       PORT MONITOR SECURITY EVENTS"
-    )
-    print(
-        "============================================"
-    )
-    print()
+    elif event_type == "network":
 
+        files = [
+            (
+                "NETWORK EVENTS",
+                NETWORK_EVENTS_FILE
+            )
+        ]
 
-    if not events:
+    elif event_type == "services":
+
+        files = [
+            (
+                "SERVICE EVENTS",
+                SERVICE_EVENTS_FILE
+            )
+        ]
+
+    else:
+
+        files = [
+            (
+                "PORT EVENTS",
+                PORT_EVENTS_FILE
+            ),
+            (
+                "NETWORK EVENTS",
+                NETWORK_EVENTS_FILE
+            ),
+            (
+                "SERVICE EVENTS",
+                SERVICE_EVENTS_FILE
+            )
+        ]
+
+    for title, path in files:
+
+        events = load_json(
+            path,
+            []
+        )
+
+        if not isinstance(
+            events,
+            list
+        ):
+
+            events = []
+
+        events = events[
+            -count:
+        ]
 
         print(
-            "No events."
+            "========================================"
         )
 
-        return 0
-
-
-    for event in reversed(
-        events[-50:]
-    ):
-
-        timestamp = event.get(
-            "timestamp",
-            0
+        print(
+            f"          {title}"
         )
 
+        print(
+            "========================================"
+        )
 
-        try:
+        print()
 
-            date_text = time.strftime(
-                "%Y-%m-%d %H:%M:%S",
-                time.localtime(
-                    timestamp
-                )
+        if not events:
+
+            print(
+                "No events."
             )
 
-        except Exception:
+            print()
 
-            date_text = "unknown"
+            continue
 
-
-        print(
-            f"[{date_text}] "
-            f"{event.get('type', 'UNKNOWN')}"
-        )
-
-
-        data = event.get(
-            "data",
-            {}
-        )
-
-
-        if isinstance(
-            data,
-            dict
+        for event in reversed(
+            events
         ):
 
             print(
                 json.dumps(
-                    data,
+                    event,
                     ensure_ascii=False
                 )
             )
-
 
         print()
 
@@ -1756,237 +1911,353 @@ def command_events():
 
 
 # ============================================================
-# LIVE MONITOR
-# ============================================================
-
-def command_monitor(
-    interval: int
-):
-
-    print()
-    print(
-        "============================================"
-    )
-    print(
-        "       SERVERGUARD LIVE MONITOR"
-    )
-    print(
-        "============================================"
-    )
-    print()
-
-
-    print(
-        f"Interval: {interval} seconds"
-    )
-
-
-    print(
-        "Press Ctrl+C to stop."
-    )
-
-
-    print()
-
-
-    previous = create_snapshot()
-
-
-    while True:
-
-        try:
-
-            time.sleep(
-                interval
-            )
-
-        except KeyboardInterrupt:
-
-            print()
-            print(
-                "Live monitor stopped."
-            )
-
-            return 0
-
-
-        current = (
-            create_snapshot()
-        )
-
-
-        changes = compare_ports(
-            previous[
-                "ports"
-            ],
-            current[
-                "ports"
-            ]
-        )
-
-
-        service_changes = (
-            compare_services(
-                previous[
-                    "services"
-                ],
-                current[
-                    "services"
-                ]
-            )
-        )
-
-
-        changed = (
-            bool(
-                changes["added"]
-            )
-            or
-            bool(
-                changes["removed"]
-            )
-            or
-            bool(
-                changes["changed"]
-            )
-            or
-            bool(
-                service_changes["added"]
-            )
-            or
-            bool(
-                service_changes["removed"]
-            )
-        )
-
-
-        if changed:
-
-            print()
-            print(
-                "!!! SECURITY CHANGE DETECTED !!!"
-            )
-
-
-            for item in changes[
-                "added"
-            ]:
-
-                print(
-                    "NEW PORT: " +
-                    format_port(
-                        item
-                    )
-                )
-
-
-                add_event(
-                    "LIVE_PORT_ADDED",
-                    item
-                )
-
-
-            for item in changes[
-                "removed"
-            ]:
-
-                print(
-                    "REMOVED PORT: " +
-                    format_port(
-                        item
-                    )
-                )
-
-
-                add_event(
-                    "LIVE_PORT_REMOVED",
-                    item
-                )
-
-
-            for item in changes[
-                "changed"
-            ]:
-
-                print(
-                    "PROCESS CHANGED:"
-                )
-
-
-                print(
-                    " OLD: " +
-                    format_port(
-                        item["old"]
-                    )
-                )
-
-
-                print(
-                    " NEW: " +
-                    format_port(
-                        item["new"]
-                    )
-                )
-
-
-                add_event(
-                    "LIVE_PROCESS_CHANGED",
-                    item
-                )
-
-
-            for service in service_changes[
-                "added"
-            ]:
-
-                print(
-                    "NEW SERVICE: " +
-                    service
-                )
-
-
-                add_event(
-                    "LIVE_SERVICE_ADDED",
-                    {
-                        "service": service
-                    }
-                )
-
-
-            for service in service_changes[
-                "removed"
-            ]:
-
-                print(
-                    "REMOVED SERVICE: " +
-                    service
-                )
-
-
-                add_event(
-                    "LIVE_SERVICE_REMOVED",
-                    {
-                        "service": service
-                    }
-                )
-
-
-            print()
-
-
-        previous = current
-
-
-# ============================================================
 # VERSION
 # ============================================================
 
-def command_version():
+def show_version():
 
     print(
-        f"ServerGuard Port & Service Monitor "
-        f"v{VERSION}"
+        "ServerGuard Port & Service Monitor"
     )
+
+    print(
+        f"Version: {VERSION}"
+    )
+
+    print(
+        f"State: {STATE_FILE}"
+    )
+
+    print(
+        f"Port events: {PORT_EVENTS_FILE}"
+    )
+
+    print(
+        f"Network events: {NETWORK_EVENTS_FILE}"
+    )
+
+    print(
+        f"Service events: {SERVICE_EVENTS_FILE}"
+    )
+
+    return 0
+
+
+# ============================================================
+# MONITOR
+# ============================================================
+
+def monitor(
+    interval
+):
+
+    create_directories()
+
+    print(
+        "========================================",
+        flush=True
+    )
+
+    print(
+        "     SERVERGUARD BACKGROUND MONITOR",
+        flush=True
+    )
+
+    print(
+        "========================================",
+        flush=True
+    )
+
+    print(
+        f"Version: {VERSION}",
+        flush=True
+    )
+
+    print(
+        f"Interval: {interval} seconds",
+        flush=True
+    )
+
+    print(
+        "Monitoring: ON",
+        flush=True
+    )
+
+    print(
+        flush=True
+    )
+
+    state = load_state()
+
+    old_ports = state.get(
+        "ports",
+        []
+    )
+
+    old_connections = state.get(
+        "connections",
+        []
+    )
+
+    old_services = state.get(
+        "services",
+        {}
+    )
+
+    first_run = not bool(
+        state
+    )
+
+    if not isinstance(
+        old_ports,
+        list
+    ):
+
+        old_ports = []
+
+    if not isinstance(
+        old_connections,
+        list
+    ):
+
+        old_connections = []
+
+    if not isinstance(
+        old_services,
+        dict
+    ):
+
+        old_services = {}
+
+    print(
+        "Initial scan...",
+        flush=True
+    )
+
+    current_ports = scan_listening_ports()
+
+    current_connections = scan_network_connections()
+
+    current_services = get_services()
+
+    if first_run:
+
+        print(
+            "Initial state saved.",
+            flush=True
+        )
+
+        print(
+            f"Listening ports: "
+            f"{len(current_ports)}",
+            flush=True
+        )
+
+        print(
+            f"Connections: "
+            f"{len(current_connections)}",
+            flush=True
+        )
+
+        print(
+            f"Services: "
+            f"{len(current_services)}",
+            flush=True
+        )
+
+    else:
+
+        compare_ports(
+            old_ports,
+            current_ports,
+            False
+        )
+
+        compare_connections(
+            old_connections,
+            current_connections,
+            False
+        )
+
+        compare_services(
+            old_services,
+            current_services,
+            False
+        )
+
+    save_state(
+        current_ports,
+        current_connections,
+        current_services
+    )
+
+    while running:
+
+        for _ in range(
+            interval
+        ):
+
+            if not running:
+
+                break
+
+            time.sleep(
+                1
+            )
+
+        if not running:
+
+            break
+
+        try:
+
+            current_ports = scan_listening_ports()
+
+            current_connections = scan_network_connections()
+
+            current_services = get_services()
+
+            compare_ports(
+                old_ports,
+                current_ports,
+                False
+            )
+
+            compare_connections(
+                old_connections,
+                current_connections,
+                False
+            )
+
+            compare_services(
+                old_services,
+                current_services,
+                False
+            )
+
+            save_state(
+                current_ports,
+                current_connections,
+                current_services
+            )
+
+            old_ports = current_ports
+
+            old_connections = current_connections
+
+            old_services = current_services
+
+        except Exception as error:
+
+            print(
+                f"[MONITOR ERROR] {error}",
+                flush=True
+            )
+
+    print(
+        "Monitoring stopped.",
+        flush=True
+    )
+
+    return 0
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+def show_help():
+
+    print(
+        "ServerGuard Port & Service Monitor"
+    )
+
+    print()
+
+    print(
+        "Commands:"
+    )
+
+    print(
+        "  scan"
+    )
+
+    print(
+        "      Show listening ports."
+    )
+
+    print(
+        "  port <PORT>"
+    )
+
+    print(
+        "      Show information about a port."
+    )
+
+    print(
+        "  services"
+    )
+
+    print(
+        "      Show running systemd services."
+    )
+
+    print(
+        "  baseline"
+    )
+
+    print(
+        "      Create port baseline."
+    )
+
+    print(
+        "  check"
+    )
+
+    print(
+        "      Compare current ports with baseline."
+    )
+
+    print(
+        "  events"
+    )
+
+    print(
+        "      Show stored monitoring events."
+    )
+
+    print(
+        "  monitor"
+    )
+
+    print(
+        "      Start permanent background monitoring."
+    )
+
+    print(
+        "  version"
+    )
+
+    print(
+        "      Show monitor version."
+    )
+
+    print()
+
+    print(
+        "Options:"
+    )
+
+    print(
+        "  --interval SECONDS"
+    )
+
+    print(
+        f"      Monitor interval. Default: "
+        f"{DEFAULT_INTERVAL}"
+    )
+
+    print()
 
     return 0
 
@@ -1997,27 +2268,13 @@ def command_version():
 
 def main():
 
-    ensure_directories()
-
+    create_directories()
 
     parser = argparse.ArgumentParser(
-        description=
-        "ServerGuard Port & Service Monitor"
+        description=(
+            "ServerGuard Port & Service Monitor"
+        )
     )
-
-
-    parser.add_argument(
-        "command",
-        nargs="?",
-        default="scan"
-    )
-
-
-    parser.add_argument(
-        "value",
-        nargs="?"
-    )
-
 
     parser.add_argument(
         "--interval",
@@ -2025,54 +2282,51 @@ def main():
         default=DEFAULT_INTERVAL
     )
 
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default=""
+    )
+
+    parser.add_argument(
+        "value",
+        nargs="?"
+    )
 
     args = parser.parse_args()
 
+    if args.interval < 1:
+
+        print(
+            "Interval must be at least 1 second."
+        )
+
+        return 1
 
     command = (
-        args.command.lower()
+        args.command
+        .strip()
+        .lower()
     )
 
+    if not command:
 
-    # --------------------------------------------------------
-    # VERSION
-    # --------------------------------------------------------
+        return show_help()
 
-    if command in (
-        "--version",
-        "version"
-    ):
+    if command == "scan":
 
-        return command_version()
-
-
-    # --------------------------------------------------------
-    # SCAN
-    # --------------------------------------------------------
-
-    if command in (
-        "scan",
-        "ports"
-    ):
-
-        return command_scan()
-
-
-    # --------------------------------------------------------
-    # PORT
-    # --------------------------------------------------------
+        return show_ports()
 
     if command == "port":
 
         if args.value is None:
 
             print(
-                "Port number required.",
-                file=sys.stderr
+                "Usage: port_service_monitor.py "
+                "port <PORT>"
             )
 
             return 1
-
 
         try:
 
@@ -2083,139 +2337,57 @@ def main():
         except ValueError:
 
             print(
-                "Invalid port.",
-                file=sys.stderr
+                "Invalid port."
             )
 
             return 1
 
-
-        if (
-            port < 1
-            or
-            port > 65535
-        ):
+        if port < 1 or port > 65535:
 
             print(
                 "Port must be between "
-                "1 and 65535.",
-                file=sys.stderr
+                "1 and 65535."
             )
 
             return 1
 
-
-        return command_port(
+        return show_port(
             port
         )
 
+    if command == "services":
 
-    # --------------------------------------------------------
-    # SERVICES
-    # --------------------------------------------------------
-
-    if command in (
-        "services",
-        "service"
-    ):
-
-        return command_services()
-
-
-    # --------------------------------------------------------
-    # BASELINE
-    # --------------------------------------------------------
+        return show_services()
 
     if command == "baseline":
 
-        return command_baseline()
-
-
-    # --------------------------------------------------------
-    # CHECK
-    # --------------------------------------------------------
+        return create_baseline()
 
     if command == "check":
 
-        return command_check()
-
-
-    # --------------------------------------------------------
-    # EVENTS
-    # --------------------------------------------------------
+        return check_baseline()
 
     if command == "events":
 
-        return command_events()
+        return show_events()
 
+    if command == "monitor":
 
-    # --------------------------------------------------------
-    # LIVE MONITOR
-    # --------------------------------------------------------
-
-    if command in (
-        "monitor",
-        "live"
-    ):
-
-        interval = max(
-            5,
+        return monitor(
             args.interval
         )
 
+    if command == "version":
 
-        return command_monitor(
-            interval
-        )
-
-
-    # --------------------------------------------------------
-    # HELP
-    # --------------------------------------------------------
+        return show_version()
 
     print(
-        "ServerGuard Port & Service Monitor"
+        f"Unknown command: {command}"
     )
 
     print()
-    print(
-        "Commands:"
-    )
 
-    print(
-        "  scan"
-    )
-
-    print(
-        "  port <PORT>"
-    )
-
-    print(
-        "  services"
-    )
-
-    print(
-        "  baseline"
-    )
-
-    print(
-        "  check"
-    )
-
-    print(
-        "  events"
-    )
-
-    print(
-        "  monitor"
-    )
-
-    print(
-        "  version"
-    )
-
-
-    return 0
+    return show_help()
 
 
 # ============================================================
@@ -2224,27 +2396,6 @@ def main():
 
 if __name__ == "__main__":
 
-    try:
-
-        sys.exit(
-            main()
-        )
-
-    except KeyboardInterrupt:
-
-        print()
-
-        sys.exit(
-            0
-        )
-
-    except Exception as error:
-
-        print(
-            f"ServerGuard monitor error: {error}",
-            file=sys.stderr
-        )
-
-        sys.exit(
-            1
-        )
+    sys.exit(
+        main()
+    )
