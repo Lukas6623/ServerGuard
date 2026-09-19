@@ -1,59 +1,28 @@
 #!/usr/bin/env python3
 
 import json
+import os
 import re
 import subprocess
+import sys
 import time
-from pathlib import Path
+
 from datetime import datetime, timezone
+from pathlib import Path
 
 
 # ============================================================
-# SERVERGUARD SSH PROTECTION
-# ============================================================
-#
-# Dynamic protection settings:
-#
-#   /opt/serverguard/data/protection_config.json
-#
-# Settings can be changed from the Telegram bot without
-# restarting this service.
-#
-# Protection works by CURRENT CONSECUTIVE FAILED SSH ATTEMPTS.
-#
-# Example:
-#
-#   attempts = 5
-#   duration = 10 minutes
-#
-# Result:
-#
-#   1 failed  -> no block
-#   2 failed  -> no block
-#   ...
-#   5 failed  -> IP blocked for 10 minutes
-#
-# A successful SSH login resets the current failed streak.
-#
-# If attempts = 1:
-#
-#   Every failed SSH login causes an IP block.
-#
-# The firewall mechanism is UFW.
-#
-# ============================================================
-
-
-# ============================================================
-# PATHS
+# CONFIGURATION
 # ============================================================
 
 BASE_DIR = Path(
     "/opt/serverguard"
 )
 
-DATA_DIR = (
-    BASE_DIR / "data"
+DATA_DIR = BASE_DIR / "data"
+
+PROTECTION_CONFIG_FILE = (
+    DATA_DIR / "protection_config.json"
 )
 
 EVENTS_FILE = (
@@ -65,21 +34,9 @@ BLOCKS_FILE = (
 )
 
 STATS_FILE = (
-    DATA_DIR / "ip_stats.json"
+    DATA_DIR / "stats.json"
 )
 
-OWNER_CONFIG_FILE = (
-    DATA_DIR / "owner_keys.json"
-)
-
-PROTECTION_CONFIG_FILE = (
-    DATA_DIR / "protection_config.json"
-)
-
-
-# ============================================================
-# EVENT STORAGE LIMITS
-# ============================================================
 
 MAX_EVENTS = 2000
 
@@ -87,51 +44,70 @@ EVENT_RETENTION_DAYS = 7
 
 CLEANUP_INTERVAL = 60
 
-
-# ============================================================
-# IP STATISTICS
-# ============================================================
-
-STATS_RETENTION_DAYS = 30
+CONFIG_CHECK_INTERVAL = 5
 
 
 # ============================================================
-# DEFAULT PROTECTION SETTINGS
+# DEFAULT PROTECTION
 # ============================================================
 
-DEFAULT_PROTECTION_CONFIG = {
+DEFAULT_CONFIG = {
 
     "enabled": True,
 
-    # Number of consecutive failed attempts before blocking.
     "attempts": 5,
 
-    # Block duration in seconds.
-    "duration": 10 * 60,
+    "duration": 600,
 
-    # If True, block forever.
     "permanent": False,
 
-    # Current protection mode.
     "mode": "ip",
 
-    # Static emergency whitelist.
     "whitelist": []
 }
+
+
+# ============================================================
+# RUNTIME
+# ============================================================
+
+FAILED_ATTEMPTS = {}
+
+LAST_CONFIG_LOAD = 0
+
+CACHED_CONFIG = dict(
+    DEFAULT_CONFIG
+)
+
+
+# ============================================================
+# LOG
+# ============================================================
+
+def log(
+    message
+):
+
+    print(
+        f"[ServerGuard] {message}",
+        flush=True
+    )
 
 
 # ============================================================
 # DIRECTORIES
 # ============================================================
 
-DATA_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
+def ensure_directories():
+
+    DATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
 
 # ============================================================
-# JSON HELPERS
+# JSON LOAD
 # ============================================================
 
 def load_json(
@@ -150,19 +126,24 @@ def load_json(
             encoding="utf-8"
         ) as file:
 
-            return json.load(
+            data = json.load(
                 file
             )
 
+        return data
+
     except Exception as e:
 
-        print(
-            f"[ERROR] Cannot load {path}: {e}",
-            flush=True
+        log(
+            f"JSON load error {path}: {e}"
         )
 
         return default
 
+
+# ============================================================
+# JSON SAVE
+# ============================================================
 
 def save_json(
     path,
@@ -174,6 +155,11 @@ def save_json(
     )
 
     try:
+
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
 
         with temp.open(
             "w",
@@ -199,9 +185,8 @@ def save_json(
 
     except Exception as e:
 
-        print(
-            f"[ERROR] Cannot save {path}: {e}",
-            flush=True
+        log(
+            f"JSON save error {path}: {e}"
         )
 
         try:
@@ -218,47 +203,86 @@ def save_json(
 
 
 # ============================================================
-# PROTECTION CONFIGURATION
+# LOAD PROTECTION CONFIG
 # ============================================================
 
-def normalize_protection_config(
-    config
-):
+def load_protection_config():
+
+    global CACHED_CONFIG
+    global LAST_CONFIG_LOAD
+
+    now = time.time()
+
+    if (
+        now - LAST_CONFIG_LOAD
+        < CONFIG_CHECK_INTERVAL
+    ):
+
+        return dict(
+            CACHED_CONFIG
+        )
+
+    LAST_CONFIG_LOAD = now
+
+    data = load_json(
+        PROTECTION_CONFIG_FILE,
+        dict(DEFAULT_CONFIG)
+    )
 
     if not isinstance(
-        config,
+        data,
         dict
     ):
 
-        config = {}
-
-    result = dict(
-        DEFAULT_PROTECTION_CONFIG
-    )
-
-    result.update(
-        config
-    )
-
-    # --------------------------------------------------------
-    # enabled
-    # --------------------------------------------------------
-
-    result["enabled"] = bool(
-        result.get(
-            "enabled",
-            True
+        data = dict(
+            DEFAULT_CONFIG
         )
+
+    config = dict(
+        DEFAULT_CONFIG
+    )
+
+    config.update(
+        data
     )
 
     # --------------------------------------------------------
-    # attempts
+    # ENABLED
+    # --------------------------------------------------------
+
+    enabled = config.get(
+        "enabled",
+        True
+    )
+
+    if isinstance(
+        enabled,
+        str
+    ):
+
+        enabled = (
+            enabled.lower()
+            in (
+                "1",
+                "true",
+                "yes",
+                "on",
+                "enabled"
+            )
+        )
+
+    config["enabled"] = bool(
+        enabled
+    )
+
+    # --------------------------------------------------------
+    # ATTEMPTS
     # --------------------------------------------------------
 
     try:
 
         attempts = int(
-            result.get(
+            config.get(
                 "attempts",
                 5
             )
@@ -268,7 +292,7 @@ def normalize_protection_config(
 
         attempts = 5
 
-    attempts = max(
+    config["attempts"] = max(
         1,
         min(
             attempts,
@@ -276,16 +300,14 @@ def normalize_protection_config(
         )
     )
 
-    result["attempts"] = attempts
-
     # --------------------------------------------------------
-    # duration
+    # DURATION
     # --------------------------------------------------------
 
     try:
 
         duration = int(
-            result.get(
+            config.get(
                 "duration",
                 600
             )
@@ -295,7 +317,7 @@ def normalize_protection_config(
 
         duration = 600
 
-    duration = max(
+    config["duration"] = max(
         60,
         min(
             duration,
@@ -303,41 +325,40 @@ def normalize_protection_config(
         )
     )
 
-    result["duration"] = duration
-
     # --------------------------------------------------------
-    # permanent
+    # PERMANENT
     # --------------------------------------------------------
 
-    result["permanent"] = bool(
-        result.get(
-            "permanent",
-            False
+    permanent = config.get(
+        "permanent",
+        False
+    )
+
+    if isinstance(
+        permanent,
+        str
+    ):
+
+        permanent = (
+            permanent.lower()
+            in (
+                "1",
+                "true",
+                "yes",
+                "on",
+                "enabled"
+            )
         )
+
+    config["permanent"] = bool(
+        permanent
     )
 
     # --------------------------------------------------------
-    # mode
+    # WHITELIST
     # --------------------------------------------------------
 
-    mode = str(
-        result.get(
-            "mode",
-            "ip"
-        )
-    ).strip().lower()
-
-    if mode != "ip":
-
-        mode = "ip"
-
-    result["mode"] = mode
-
-    # --------------------------------------------------------
-    # whitelist
-    # --------------------------------------------------------
-
-    whitelist = result.get(
+    whitelist = config.get(
         "whitelist",
         []
     )
@@ -349,481 +370,111 @@ def normalize_protection_config(
 
         whitelist = []
 
-    clean_whitelist = []
+    clean = []
 
     for ip in whitelist:
 
-        if not isinstance(
-            ip,
-            str
-        ):
+        ip = str(
+            ip
+        ).strip()
 
-            continue
+        if ip and ip not in clean:
 
-        ip = ip.strip()
-
-        if not ip:
-
-            continue
-
-        if ip not in clean_whitelist:
-
-            clean_whitelist.append(
+            clean.append(
                 ip
             )
 
-    result["whitelist"] = clean_whitelist
+    config["whitelist"] = clean
 
-    return result
+    # --------------------------------------------------------
+    # MODE
+    # --------------------------------------------------------
 
+    config["mode"] = "ip"
 
-def load_protection_config():
-
-    config = load_json(
-        PROTECTION_CONFIG_FILE,
-        DEFAULT_PROTECTION_CONFIG
-    )
-
-    config = normalize_protection_config(
-        config
-    )
-
-    # Create or repair configuration.
-    save_json(
-        PROTECTION_CONFIG_FILE,
-        config
-    )
-
-    return config
-
-
-def save_protection_config(
-    config
-):
-
-    config = normalize_protection_config(
-        config
-    )
-
-    return save_json(
-        PROTECTION_CONFIG_FILE,
-        config
-    )
-
-
-# Create configuration file immediately.
-protection_config = load_protection_config()
-
-
-# ============================================================
-# CONFIGURATION ACCESS
-# ============================================================
-
-def get_protection_config():
-
-    global protection_config
-
-    # IMPORTANT:
-    # Reload configuration dynamically.
-    #
-    # This means Telegram changes take effect without restarting
-    # serverguard-security.service.
-
-    protection_config = load_protection_config()
+    CACHED_CONFIG = config
 
     return dict(
-        protection_config
-    )
-
-
-def is_protection_enabled():
-
-    config = get_protection_config()
-
-    return bool(
-        config.get(
-            "enabled",
-            True
-        )
-    )
-
-
-def get_protection_attempts():
-
-    config = get_protection_config()
-
-    return int(
-        config.get(
-            "attempts",
-            5
-        )
-    )
-
-
-def get_protection_duration():
-
-    config = get_protection_config()
-
-    return int(
-        config.get(
-            "duration",
-            600
-        )
-    )
-
-
-def is_permanent_protection():
-
-    config = get_protection_config()
-
-    return bool(
-        config.get(
-            "permanent",
-            False
-        )
-    )
-
-
-def get_whitelist():
-
-    config = get_protection_config()
-
-    return set(
-        config.get(
-            "whitelist",
-            []
-        )
+        config
     )
 
 
 # ============================================================
-# DATA
+# DATETIME
 # ============================================================
 
-events = load_json(
-    EVENTS_FILE,
-    []
-)
-
-blocks = load_json(
-    BLOCKS_FILE,
-    {}
-)
-
-ip_stats = load_json(
-    STATS_FILE,
-    {}
-)
-
-owner_config = load_json(
-    OWNER_CONFIG_FILE,
-    {
-        "usernames": [],
-        "fingerprints": []
-    }
-)
-
-
-# ============================================================
-# DATA VALIDATION
-# ============================================================
-
-if not isinstance(
-    events,
-    list
-):
-
-    events = []
-
-
-if not isinstance(
-    blocks,
-    dict
-):
-
-    blocks = {}
-
-
-if not isinstance(
-    ip_stats,
-    dict
-):
-
-    ip_stats = {}
-
-
-if not isinstance(
-    owner_config,
-    dict
-):
-
-    owner_config = {}
-
-
-if not isinstance(
-    owner_config.get(
-        "usernames"
-    ),
-    list
-):
-
-    owner_config["usernames"] = []
-
-
-if not isinstance(
-    owner_config.get(
-        "fingerprints"
-    ),
-    list
-):
-
-    owner_config["fingerprints"] = []
-
-
-# ============================================================
-# TIME
-# ============================================================
-
-def now():
-
-    return int(
-        time.time()
-    )
-
-
-def iso_time(
+def utc_iso(
     timestamp=None
 ):
 
     if timestamp is None:
 
-        timestamp = now()
+        timestamp = time.time()
 
     return datetime.fromtimestamp(
         timestamp,
-        timezone.utc
+        tz=timezone.utc
     ).isoformat()
 
 
 # ============================================================
-# IP VALIDATION
+# EVENTS
 # ============================================================
 
-IP_REGEX = re.compile(
-    r"^(?:"
-    r"(?:\d{1,3}\.){3}\d{1,3}"
-    r"|"
-    r"[0-9a-fA-F:]+"
-    r")$"
-)
+def load_events():
 
-
-def valid_ip(
-    ip
-):
-
-    if not ip:
-
-        return False
-
-    if len(ip) > 45:
-
-        return False
-
-    return bool(
-        IP_REGEX.match(
-            ip
-        )
+    data = load_json(
+        EVENTS_FILE,
+        []
     )
 
+    if not isinstance(
+        data,
+        list
+    ):
 
-# ============================================================
-# WHITELIST
-# ============================================================
+        return []
 
-def is_whitelisted(
-    ip
+    return data
+
+
+def save_event(
+    event_type,
+    ip,
+    username="unknown",
+    auth_method="",
+    raw=""
 ):
 
-    if not valid_ip(
-        ip
-    ):
+    events = load_events()
 
-        return False
+    event = {
 
-    return ip in get_whitelist()
+        "time":
+            int(time.time()),
 
+        "time_iso":
+            utc_iso(),
 
-# ============================================================
-# OWNER CONFIGURATION
-# ============================================================
+        "type":
+            event_type,
 
-def get_owner_usernames():
-
-    result = set()
-
-    for username in owner_config.get(
-        "usernames",
-        []
-    ):
-
-        if isinstance(
+        "username":
             username,
-            str
-        ):
 
-            username = username.strip()
+        "ip":
+            ip,
 
-            if username:
+        "auth_method":
+            auth_method,
 
-                result.add(
-                    username
-                )
+        "raw":
+            raw
+    }
 
-    return result
-
-
-def get_owner_fingerprints():
-
-    result = set()
-
-    for fingerprint in owner_config.get(
-        "fingerprints",
-        []
-    ):
-
-        if isinstance(
-            fingerprint,
-            str
-        ):
-
-            fingerprint = fingerprint.strip()
-
-            if fingerprint:
-
-                result.add(
-                    fingerprint
-                )
-
-    return result
-
-
-def is_owner_public_key(
-    username,
-    fingerprint
-):
-
-    if not username:
-
-        return False
-
-    if not fingerprint:
-
-        return False
-
-    usernames = get_owner_usernames()
-
-    fingerprints = get_owner_fingerprints()
-
-    return (
-        username in usernames
-        and
-        fingerprint in fingerprints
+    events.append(
+        event
     )
-
-
-def print_owner_config():
-
-    usernames = sorted(
-        get_owner_usernames()
-    )
-
-    fingerprints = sorted(
-        get_owner_fingerprints()
-    )
-
-    print(
-        f"[OWNER] Config: {OWNER_CONFIG_FILE}",
-        flush=True
-    )
-
-    print(
-        f"[OWNER] Users: "
-        f"{', '.join(usernames) if usernames else 'NONE'}",
-        flush=True
-    )
-
-    print(
-        f"[OWNER] SSH fingerprints: "
-        f"{len(fingerprints)}",
-        flush=True
-    )
-
-
-if not OWNER_CONFIG_FILE.exists():
-
-    save_json(
-        OWNER_CONFIG_FILE,
-        {
-            "usernames": [],
-            "fingerprints": []
-        }
-    )
-
-
-# ============================================================
-# EVENT CLEANUP
-# ============================================================
-
-def cleanup_old_events():
-
-    global events
-
-    if not events:
-
-        return False
-
-    current_time = now()
-
-    cutoff = (
-        current_time
-        -
-        EVENT_RETENTION_DAYS * 24 * 60 * 60
-    )
-
-    original_count = len(
-        events
-    )
-
-    cleaned_events = []
-
-    for event in events:
-
-        if not isinstance(
-            event,
-            dict
-        ):
-
-            continue
-
-        event_time = event.get(
-            "time"
-        )
-
-        if not isinstance(
-            event_time,
-            (int, float)
-        ):
-
-            continue
-
-        if event_time >= cutoff:
-
-            cleaned_events.append(
-                event
-            )
-
-    events = cleaned_events
 
     if len(events) > MAX_EVENTS:
 
@@ -831,624 +482,148 @@ def cleanup_old_events():
             -MAX_EVENTS:
         ]
 
-    changed = (
-        len(events)
-        != original_count
-    )
-
-    if changed:
-
-        save_json(
-            EVENTS_FILE,
-            events
-        )
-
-        print(
-            f"[CLEANUP] SSH events: "
-            f"{original_count} -> {len(events)}",
-            flush=True
-        )
-
-    return changed
-
-
-# ============================================================
-# IP STATISTICS
-# ============================================================
-
-def create_empty_stats():
-
-    return {
-
-        "failed_attempts": 0,
-
-        "successful_logins": 0,
-
-        "current_failed_streak": 0,
-
-        "first_seen": now(),
-
-        "last_seen": now(),
-
-        "last_failed": None,
-
-        "last_success": None,
-
-        "last_success_method": None,
-
-        "last_success_fingerprint": None,
-
-        "users": []
-    }
-
-
-def normalize_stats():
-
-    global ip_stats
-
-    changed = False
-
-    for ip in list(
-        ip_stats.keys()
-    ):
-
-        stats = ip_stats[ip]
-
-        if not isinstance(
-            stats,
-            dict
-        ):
-
-            ip_stats[ip] = create_empty_stats()
-
-            changed = True
-
-            continue
-
-        defaults = create_empty_stats()
-
-        for key, value in defaults.items():
-
-            if key not in stats:
-
-                stats[key] = value
-
-                changed = True
-
-        if not isinstance(
-            stats.get(
-                "users"
-            ),
-            list
-        ):
-
-            stats["users"] = []
-
-            changed = True
-
-        if not isinstance(
-            stats.get(
-                "current_failed_streak"
-            ),
-            int
-        ):
-
-            stats[
-                "current_failed_streak"
-            ] = 0
-
-            changed = True
-
-    if changed:
-
-        save_json(
-            STATS_FILE,
-            ip_stats
-        )
-
-
-# ============================================================
-# REBUILD STATISTICS
-# ============================================================
-
-def rebuild_stats_from_events():
-
-    global ip_stats
-
-    if ip_stats:
-
-        return
-
-    if not events:
-
-        return
-
-    print(
-        "[STATS] Building IP statistics "
-        "from existing SSH events...",
-        flush=True
-    )
-
-    new_stats = {}
-
-    sorted_events = sorted(
-
-        [
-            event
-            for event in events
-            if isinstance(
-                event,
-                dict
-            )
-        ],
-
-        key=lambda event: (
-            event.get(
-                "time",
-                0
-            )
-            if isinstance(
-                event.get(
-                    "time",
-                    0
-                ),
-                (int, float)
-            )
-            else 0
-        )
-    )
-
-    for event in sorted_events:
-
-        ip = event.get(
-            "ip"
-        )
-
-        if not valid_ip(
-            ip
-        ):
-
-            continue
-
-        event_type = event.get(
-            "type"
-        )
-
-        username = event.get(
-            "username"
-        )
-
-        event_time = event.get(
-            "time"
-        )
-
-        if not isinstance(
-            event_time,
-            (int, float)
-        ):
-
-            event_time = now()
-
-        if ip not in new_stats:
-
-            new_stats[ip] = {
-
-                "failed_attempts": 0,
-
-                "successful_logins": 0,
-
-                "current_failed_streak": 0,
-
-                "first_seen": event_time,
-
-                "last_seen": event_time,
-
-                "last_failed": None,
-
-                "last_success": None,
-
-                "last_success_method": None,
-
-                "last_success_fingerprint": None,
-
-                "users": []
-            }
-
-        stats = new_stats[
-            ip
-        ]
-
-        if event_time < stats[
-            "first_seen"
-        ]:
-
-            stats[
-                "first_seen"
-            ] = event_time
-
-        if event_time > stats[
-            "last_seen"
-        ]:
-
-            stats[
-                "last_seen"
-            ] = event_time
-
-        if (
-            username
-            and
-            isinstance(
-                username,
-                str
-            )
-            and
-            username not in stats[
-                "users"
-            ]
-        ):
-
-            stats[
-                "users"
-            ].append(
-                username
-            )
-
-            if len(
-                stats["users"]
-            ) > 20:
-
-                stats[
-                    "users"
-                ] = stats[
-                    "users"
-                ][-20:]
-
-        if event_type == "failed":
-
-            stats[
-                "failed_attempts"
-            ] += 1
-
-            stats[
-                "current_failed_streak"
-            ] += 1
-
-            if (
-                stats[
-                    "last_failed"
-                ] is None
-                or
-                event_time > stats[
-                    "last_failed"
-                ]
-            ):
-
-                stats[
-                    "last_failed"
-                ] = event_time
-
-        elif event_type == "success":
-
-            stats[
-                "successful_logins"
-            ] += 1
-
-            stats[
-                "current_failed_streak"
-            ] = 0
-
-            if (
-                stats[
-                    "last_success"
-                ] is None
-                or
-                event_time > stats[
-                    "last_success"
-                ]
-            ):
-
-                stats[
-                    "last_success"
-                ] = event_time
-
-                stats[
-                    "last_success_method"
-                ] = event.get(
-                    "auth_method"
-                )
-
-                stats[
-                    "last_success_fingerprint"
-                ] = event.get(
-                    "fingerprint"
-                )
-
-    ip_stats = new_stats
-
     save_json(
-        STATS_FILE,
-        ip_stats
-    )
-
-    print(
-        f"[STATS] Created statistics "
-        f"for {len(ip_stats)} IPs",
-        flush=True
+        EVENTS_FILE,
+        events
     )
 
 
 # ============================================================
-# OLD IP STATISTICS CLEANUP
+# BLOCKS
 # ============================================================
 
-def cleanup_old_stats():
+def load_blocks():
 
-    global ip_stats
-
-    if not ip_stats:
-
-        return False
-
-    current_time = now()
-
-    cutoff = (
-        current_time
-        -
-        STATS_RETENTION_DAYS * 24 * 60 * 60
-    )
-
-    changed = False
-
-    removed = 0
-
-    for ip in list(
-        ip_stats.keys()
-    ):
-
-        stats = ip_stats.get(
-            ip
-        )
-
-        if not isinstance(
-            stats,
-            dict
-        ):
-
-            del ip_stats[
-                ip
-            ]
-
-            changed = True
-
-            removed += 1
-
-            continue
-
-        last_seen = stats.get(
-            "last_seen"
-        )
-
-        if not isinstance(
-            last_seen,
-            (int, float)
-        ):
-
-            last_seen = current_time
-
-        if ip in blocks:
-
-            continue
-
-        if is_whitelisted(
-            ip
-        ):
-
-            continue
-
-        if last_seen < cutoff:
-
-            del ip_stats[
-                ip
-            ]
-
-            changed = True
-
-            removed += 1
-
-    if changed:
-
-        save_json(
-            STATS_FILE,
-            ip_stats
-        )
-
-        print(
-            f"[CLEANUP] IP statistics removed: "
-            f"{removed}",
-            flush=True
-        )
-
-    return changed
-
-
-# ============================================================
-# CURRENT FAILED STREAK
-# ============================================================
-
-def get_failed_count(
-    ip
-):
-
-    stats = ip_stats.get(
-        ip
+    data = load_json(
+        BLOCKS_FILE,
+        {}
     )
 
     if not isinstance(
-        stats,
+        data,
         dict
     ):
 
-        return 0
+        return {}
 
-    streak = stats.get(
-        "current_failed_streak",
-        0
+    return data
+
+
+def save_blocks(
+    blocks
+):
+
+    save_json(
+        BLOCKS_FILE,
+        blocks
+    )
+
+
+# ============================================================
+# STATS
+# ============================================================
+
+def load_stats():
+
+    data = load_json(
+        STATS_FILE,
+        {}
     )
 
     if not isinstance(
-        streak,
-        int
+        data,
+        dict
     ):
 
-        return 0
+        data = {}
 
-    return max(
-        streak,
-        0
-    )
+    return data
 
 
-# ============================================================
-# UPDATE IP STATISTICS
-# ============================================================
-
-def update_ip_stats(
-    username,
-    ip,
-    event_type,
-    auth_method=None,
-    fingerprint=None
+def update_stat(
+    name
 ):
 
-    global ip_stats
+    stats = load_stats()
 
-    if ip not in ip_stats:
+    try:
 
-        ip_stats[
-            ip
-        ] = create_empty_stats()
-
-    stats = ip_stats[
-        ip
-    ]
-
-    current_time = now()
-
-    stats[
-        "last_seen"
-    ] = current_time
-
-    if (
-        username
-        and
-        isinstance(
-            username,
-            str
-        )
-        and
-        username not in stats[
-            "users"
-        ]
-    ):
-
-        stats[
-            "users"
-        ].append(
-            username
-        )
-
-        if len(
-            stats[
-                "users"
-            ]
-        ) > 20:
-
-            stats[
-                "users"
-            ] = stats[
-                "users"
-            ][-20:]
-
-    if event_type == "failed":
-
-        stats[
-            "failed_attempts"
-        ] = (
-            stats.get(
-                "failed_attempts",
-                0
+        stats[name] = (
+            int(
+                stats.get(
+                    name,
+                    0
+                )
             )
             + 1
         )
 
-        stats[
-            "current_failed_streak"
-        ] = (
-            stats.get(
-                "current_failed_streak",
-                0
-            )
-            + 1
-        )
+    except Exception:
 
-        stats[
-            "last_failed"
-        ] = current_time
-
-    elif event_type == "success":
-
-        stats[
-            "successful_logins"
-        ] = (
-            stats.get(
-                "successful_logins",
-                0
-            )
-            + 1
-        )
-
-        stats[
-            "current_failed_streak"
-        ] = 0
-
-        stats[
-            "last_success"
-        ] = current_time
-
-        stats[
-            "last_success_method"
-        ] = auth_method
-
-        stats[
-            "last_success_fingerprint"
-        ] = fingerprint
+        stats[name] = 1
 
     save_json(
         STATS_FILE,
-        ip_stats
+        stats
     )
 
 
 # ============================================================
-# FIREWALL
+# UFW CHECK
+# ============================================================
+
+def ufw_is_blocked(
+    ip
+):
+
+    try:
+
+        result = subprocess.run(
+
+            [
+                "ufw",
+                "status"
+            ],
+
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode != 0:
+
+            return False
+
+        return (
+            ip in result.stdout
+            and
+            "DENY" in result.stdout
+        )
+
+    except Exception as e:
+
+        log(
+            f"UFW status error: {e}"
+        )
+
+        return False
+
+
+# ============================================================
+# UFW BLOCK
 # ============================================================
 
 def ufw_block(
     ip
 ):
 
-    if is_whitelisted(
-        ip
-    ):
-
-        print(
-            f"[WHITELIST] Refusing to block {ip}",
-            flush=True
-        )
-
-        return False
-
     try:
+
+        if ufw_is_blocked(
+            ip
+        ):
+
+            return True
 
         result = subprocess.run(
 
@@ -1461,43 +636,46 @@ def ufw_block(
                 ip
             ],
 
-            stdout=subprocess.DEVNULL,
-
-            stderr=subprocess.DEVNULL,
-
+            capture_output=True,
+            text=True,
             timeout=15
         )
 
         if result.returncode == 0:
 
+            log(
+                f"[BLOCK] {ip}"
+            )
+
             return True
+
+        log(
+            f"[BLOCK ERROR] {ip}: "
+            f"{result.stderr.strip()}"
+        )
 
         return False
 
     except Exception as e:
 
-        print(
-            f"[ERROR] UFW block failed "
-            f"for {ip}: {e}",
-            flush=True
+        log(
+            f"[BLOCK ERROR] {ip}: {e}"
         )
 
         return False
 
 
+# ============================================================
+# UFW UNBLOCK
+# ============================================================
+
 def ufw_unblock(
     ip
 ):
 
-    if is_whitelisted(
-        ip
-    ):
-
-        return
-
     try:
 
-        subprocess.run(
+        result = subprocess.run(
 
             [
                 "ufw",
@@ -1507,175 +685,86 @@ def ufw_unblock(
                 ip
             ],
 
-            stdout=subprocess.DEVNULL,
-
-            stderr=subprocess.DEVNULL,
-
+            capture_output=True,
+            text=True,
             timeout=15
         )
 
-    except Exception:
+        if result.returncode == 0:
 
-        pass
+            log(
+                f"[UNBLOCK] {ip}"
+            )
 
+            return True
 
-# ============================================================
-# REMOVE STORED BLOCK
-# ============================================================
+        output = (
+            result.stdout
+            + "\n"
+            + result.stderr
+        ).lower()
 
-def remove_block(
-    ip
-):
+        if (
+            "could not delete" in output
+            or
+            "not found" in output
+            or
+            "no rules found" in output
+        ):
 
-    changed = False
+            return True
 
-    if ip in blocks:
-
-        del blocks[
-            ip
-        ]
-
-        changed = True
-
-    ufw_unblock(
-        ip
-    )
-
-    if changed:
-
-        save_json(
-            BLOCKS_FILE,
-            blocks
+        log(
+            f"[UNBLOCK ERROR] {ip}: "
+            f"{result.stderr.strip()}"
         )
 
+        return False
+
+    except Exception as e:
+
+        log(
+            f"[UNBLOCK ERROR] {ip}: {e}"
+        )
+
+        return False
+
 
 # ============================================================
-# BLOCK IP
+# WHITELIST
 # ============================================================
 
-def block_ip(
+def is_whitelisted(
     ip,
-    failed_count
+    config
 ):
 
-    if is_whitelisted(
-        ip
-    ):
-
-        print(
-            f"[WHITELIST] {ip} "
-            f"will never be blocked",
-            flush=True
-        )
-
-        return
-
-    config = get_protection_config()
-
-    if not config.get(
-        "enabled",
-        True
-    ):
-
-        return
-
-    # --------------------------------------------------------
-    # If IP already has a permanent block.
-    # --------------------------------------------------------
-
-    current = blocks.get(
-        ip
+    return ip in config.get(
+        "whitelist",
+        []
     )
 
-    if (
-        current
-        and
-        current.get(
+
+# ============================================================
+# CREATE BLOCK RECORD
+# ============================================================
+
+def create_block(
+    ip,
+    failed_attempts,
+    config
+):
+
+    now = int(
+        time.time()
+    )
+
+    permanent = bool(
+        config.get(
             "permanent",
             False
         )
-    ):
-
-        return
-
-    # --------------------------------------------------------
-    # If temporary block is still active.
-    # --------------------------------------------------------
-
-    if current:
-
-        expires = current.get(
-            "expires_at"
-        )
-
-        if (
-            not current.get(
-                "permanent",
-                False
-            )
-            and
-            expires is not None
-            and
-            now() < expires
-        ):
-
-            return
-
-        ufw_unblock(
-            ip
-        )
-
-    # --------------------------------------------------------
-    # PERMANENT BLOCK
-    # --------------------------------------------------------
-
-    if config.get(
-        "permanent",
-        False
-    ):
-
-        if ufw_block(
-            ip
-        ):
-
-            blocks[
-                ip
-            ] = {
-
-                "ip": ip,
-
-                "level": "custom",
-
-                "failed_attempts": failed_count,
-
-                "blocked_at": now(),
-
-                "blocked_at_iso": iso_time(),
-
-                "expires_at": None,
-
-                "expires_at_iso": None,
-
-                "permanent": True
-            }
-
-            save_json(
-                BLOCKS_FILE,
-                blocks
-            )
-
-            print(
-                f"[BLOCK] {ip} permanently blocked "
-                f"after {failed_count} consecutive "
-                f"failed attempts",
-                flush=True
-            )
-
-        return
-
-    # --------------------------------------------------------
-    # TEMPORARY BLOCK
-    # --------------------------------------------------------
+    )
 
     duration = int(
         config.get(
@@ -1684,88 +773,186 @@ def block_ip(
         )
     )
 
-    blocked_at = now()
+    if permanent:
 
-    expires = (
-        blocked_at
-        + duration
+        expires_at = None
+
+    else:
+
+        expires_at = (
+            now
+            + duration
+        )
+
+    blocks = load_blocks()
+
+    blocks[ip] = {
+
+        "ip":
+            ip,
+
+        "blocked_at":
+            now,
+
+        "blocked_at_iso":
+            utc_iso(now),
+
+        "failed_attempts":
+            failed_attempts,
+
+        "permanent":
+            permanent,
+
+        "duration":
+            duration,
+
+        "expires_at":
+            expires_at,
+
+        "expires_at_iso":
+            (
+                None
+                if expires_at is None
+                else
+                utc_iso(expires_at)
+            ),
+
+        "reason":
+            "SSH brute-force protection"
+    }
+
+    save_blocks(
+        blocks
     )
 
-    if ufw_block(
-        ip
+
+# ============================================================
+# BLOCK IP
+# ============================================================
+
+def block_ip(
+    ip,
+    failed_attempts,
+    config
+):
+
+    if is_whitelisted(
+        ip,
+        config
     ):
 
-        blocks[
-            ip
-        ] = {
-
-            "ip": ip,
-
-            "level": "custom",
-
-            "failed_attempts": failed_count,
-
-            "blocked_at": blocked_at,
-
-            "blocked_at_iso": iso_time(
-                blocked_at
-            ),
-
-            "expires_at": expires,
-
-            "expires_at_iso": iso_time(
-                expires
-            ),
-
-            "permanent": False
-        }
-
-        save_json(
-            BLOCKS_FILE,
-            blocks
+        log(
+            f"[WHITELIST] "
+            f"Skipping block for {ip}"
         )
 
-        if duration >= 86400:
+        return False
 
-            days = duration // 86400
+    if ip in get_local_ips():
 
-            duration_text = (
-                f"{days} days"
-            )
-
-        elif duration >= 3600:
-
-            hours = duration // 3600
-
-            duration_text = (
-                f"{hours} hours"
-            )
-
-        else:
-
-            minutes = max(
-                1,
-                duration // 60
-            )
-
-            duration_text = (
-                f"{minutes} minutes"
-            )
-
-        print(
-            f"[BLOCK] {ip} blocked for "
-            f"{duration_text} "
-            f"(consecutive failures: "
-            f"{failed_count})",
-            flush=True
+        log(
+            f"[SAFETY] "
+            f"Skipping local/server IP {ip}"
         )
+
+        return False
+
+    success = ufw_block(
+        ip
+    )
+
+    if not success:
+
+        return False
+
+    create_block(
+        ip,
+        failed_attempts,
+        config
+    )
+
+    update_stat(
+        "blocked"
+    )
+
+    if config.get(
+        "permanent",
+        False
+    ):
+
+        log(
+            f"[BLOCK] {ip} "
+            f"PERMANENT "
+            f"after {failed_attempts} failed attempts"
+        )
+
+    else:
+
+        log(
+            f"[BLOCK] {ip} "
+            f"for {config['duration']} seconds "
+            f"after {failed_attempts} failed attempts"
+        )
+
+    return True
+
+
+# ============================================================
+# LOCAL SERVER IPS
+# ============================================================
+
+def get_local_ips():
+
+    result = set()
+
+    try:
+
+        output = subprocess.check_output(
+
+            [
+                "hostname",
+                "-I"
+            ],
+
+            text=True,
+            timeout=5
+        )
+
+        for ip in output.split():
+
+            result.add(
+                ip.strip()
+            )
+
+    except Exception:
+        pass
+
+    result.add(
+        "127.0.0.1"
+    )
+
+    result.add(
+        "::1"
+    )
+
+    return result
 
 
 # ============================================================
 # EXPIRE BLOCKS
 # ============================================================
 
-def cleanup_expired_blocks():
+def expire_blocks():
+
+    blocks = load_blocks()
+
+    if not blocks:
+
+        return
+
+    now = int(
+        time.time()
+    )
 
     changed = False
 
@@ -1773,298 +960,300 @@ def cleanup_expired_blocks():
         blocks.keys()
     ):
 
-        if is_whitelisted(
+        block = blocks.get(
             ip
-        ):
-
-            ufw_unblock(
-                ip
-            )
-
-            del blocks[
-                ip
-            ]
-
-            changed = True
-
-            print(
-                f"[WHITELIST] Removed block "
-                f"for {ip}",
-                flush=True
-            )
-
-            continue
-
-        block = blocks[
-            ip
-        ]
+        )
 
         if not isinstance(
             block,
             dict
         ):
 
-            del blocks[
-                ip
-            ]
+            del blocks[ip]
 
             changed = True
 
             continue
 
         if block.get(
-            "permanent"
+            "permanent",
+            False
         ):
 
             continue
 
-        expires = block.get(
+        expires_at = block.get(
             "expires_at"
         )
 
-        if expires is None:
+        if expires_at is None:
 
             continue
 
-        if now() >= expires:
+        try:
 
-            print(
-                f"[UNBLOCK] Temporary block expired: "
-                f"{ip}",
-                flush=True
+            expires_at = int(
+                expires_at
             )
 
-            ufw_unblock(
-                ip
-            )
+        except Exception:
 
-            del blocks[
-                ip
-            ]
+            del blocks[ip]
 
             changed = True
 
+            continue
+
+        if expires_at <= now:
+
+            if ufw_unblock(
+                ip
+            ):
+
+                del blocks[ip]
+
+                changed = True
+
+                update_stat(
+                    "unblocked"
+                )
+
+                log(
+                    f"[EXPIRED] "
+                    f"{ip} temporary block expired"
+                )
+
     if changed:
 
-        save_json(
-            BLOCKS_FILE,
+        save_blocks(
             blocks
         )
 
 
 # ============================================================
-# GENERAL CLEANUP
+# CLEAN OLD EVENTS
 # ============================================================
 
-def cleanup():
+def cleanup_events():
 
-    cleanup_old_events()
+    events = load_events()
 
-    cleanup_expired_blocks()
+    if not events:
 
-    cleanup_old_stats()
+        return
 
-
-# ============================================================
-# EVENT STORAGE
-# ============================================================
-
-def save_event(
-    event_type,
-    username,
-    ip,
-    message,
-    auth_method=None,
-    fingerprint=None,
-    owner_login=False
-):
-
-    event = {
-
-        "time": now(),
-
-        "time_iso": iso_time(),
-
-        "type": event_type,
-
-        "username": username,
-
-        "ip": ip,
-
-        "auth_method": auth_method,
-
-        "fingerprint": fingerprint,
-
-        "owner_login": owner_login,
-
-        "message": message
-    }
-
-    events.append(
-        event
+    cutoff = (
+        time.time()
+        - (
+            EVENT_RETENTION_DAYS
+            * 86400
+        )
     )
 
-    if len(
-        events
-    ) > MAX_EVENTS:
+    cleaned = []
 
-        del events[
-            :-MAX_EVENTS
-        ]
+    for event in events:
 
-    save_json(
-        EVENTS_FILE,
-        events
-    )
+        if not isinstance(
+            event,
+            dict
+        ):
 
+            continue
 
-# ============================================================
-# SUCCESS
-# ============================================================
-
-def handle_success(
-    username,
-    ip,
-    message,
-    auth_method,
-    fingerprint
-):
-
-    owner_login = is_owner_public_key(
-        username,
-        fingerprint
-    )
-
-    update_ip_stats(
-        username,
-        ip,
-        "success",
-        auth_method,
-        fingerprint
-    )
-
-    save_event(
-        "success",
-        username,
-        ip,
-        message,
-        auth_method,
-        fingerprint,
-        owner_login
-    )
-
-    if owner_login:
-
-        print(
-            f"[OWNER LOGIN] "
-            f"user={username} "
-            f"ip={ip} "
-            f"fingerprint={fingerprint}",
-            flush=True
+        timestamp = event.get(
+            "time"
         )
 
-        remove_block(
+        try:
+
+            timestamp = int(
+                timestamp
+            )
+
+        except Exception:
+
+            timestamp = int(
+                time.time()
+            )
+
+        if timestamp >= cutoff:
+
+            cleaned.append(
+                event
+            )
+
+    if len(cleaned) > MAX_EVENTS:
+
+        cleaned = cleaned[
+            -MAX_EVENTS:
+        ]
+
+    if len(cleaned) != len(events):
+
+        save_json(
+            EVENTS_FILE,
+            cleaned
+        )
+
+
+# ============================================================
+# CLEAN RUNTIME COUNTERS
+# ============================================================
+
+def cleanup_attempts():
+
+    now = time.time()
+
+    for ip in list(
+        FAILED_ATTEMPTS.keys()
+    ):
+
+        data = FAILED_ATTEMPTS.get(
             ip
         )
 
-        return
+        if not isinstance(
+            data,
+            dict
+        ):
 
-    print(
-        f"[SSH SUCCESS] "
-        f"user={username} "
-        f"ip={ip} "
-        f"method={auth_method or 'unknown'}",
-        flush=True
+            del FAILED_ATTEMPTS[ip]
+
+            continue
+
+        last = data.get(
+            "last"
+        )
+
+        if last is None:
+
+            del FAILED_ATTEMPTS[ip]
+
+            continue
+
+        if (
+            now - last
+            > 3600
+        ):
+
+            del FAILED_ATTEMPTS[ip]
+
+
+# ============================================================
+# PARSE FAILED SSH LOGIN
+# ============================================================
+
+FAILED_PATTERNS = [
+
+    re.compile(
+        r"Failed password for (?:invalid user )?(\S+) from ([0-9a-fA-F\.:]+)"
+    ),
+
+    re.compile(
+        r"Failed publickey for (?:invalid user )?(\S+) from ([0-9a-fA-F\.:]+)"
+    ),
+
+    re.compile(
+        r"Invalid user (\S+) from ([0-9a-fA-F\.:]+)"
+    ),
+
+    re.compile(
+        r"authentication failure.*rhost=([0-9a-fA-F\.:]+)"
     )
+]
 
 
 # ============================================================
-# FAILED
+# PARSE SUCCESSFUL SSH LOGIN
 # ============================================================
 
-def handle_failed(
+SUCCESS_PATTERNS = [
+
+    re.compile(
+        r"Accepted password for (\S+) from ([0-9a-fA-F\.:]+)"
+    ),
+
+    re.compile(
+        r"Accepted publickey for (\S+) from ([0-9a-fA-F\.:]+)"
+    ),
+
+    re.compile(
+        r"Accepted keyboard-interactive/pam for (\S+) from ([0-9a-fA-F\.:]+)"
+    )
+]
+
+
+# ============================================================
+# HANDLE FAILED LOGIN
+# ============================================================
+
+def handle_failed_login(
     username,
     ip,
-    message
+    raw
 ):
 
-    update_ip_stats(
-        username,
-        ip,
-        "failed"
-    )
+    config = load_protection_config()
 
     save_event(
         "failed",
+        ip,
         username,
-        ip,
-        message,
-        None,
-        None,
-        False
+        "",
+        raw
     )
 
-    failed_streak = get_failed_count(
-        ip
+    update_stat(
+        "failed"
     )
-
-    stats = ip_stats.get(
-        ip,
-        {}
-    )
-
-    total_failed = stats.get(
-        "failed_attempts",
-        0
-    )
-
-    print(
-        f"[SSH FAILED] "
-        f"user={username} "
-        f"ip={ip} "
-        f"streak={failed_streak} "
-        f"total={total_failed}",
-        flush=True
-    )
-
-    # --------------------------------------------------------
-    # WHITELIST
-    # --------------------------------------------------------
-
-    if is_whitelisted(
-        ip
-    ):
-
-        print(
-            f"[WHITELIST] {ip} "
-            f"will never be blocked",
-            flush=True
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # PROTECTION DISABLED
-    # --------------------------------------------------------
-
-    config = get_protection_config()
 
     if not config.get(
         "enabled",
         True
     ):
 
-        print(
-            "[PROTECTION] Automatic blocking "
-            "is disabled.",
-            flush=True
+        return
+
+    if is_whitelisted(
+        ip,
+        config
+    ):
+
+        log(
+            f"[WHITELIST] "
+            f"Failed SSH from {ip}"
         )
 
         return
 
-    # --------------------------------------------------------
-    # BLOCKING THRESHOLD
-    # --------------------------------------------------------
+    current = FAILED_ATTEMPTS.get(
+        ip,
+        {
+            "count": 0,
+            "last": 0
+        }
+    )
+
+    current["count"] = (
+        int(
+            current.get(
+                "count",
+                0
+            )
+        )
+        + 1
+    )
+
+    current["last"] = time.time()
+
+    FAILED_ATTEMPTS[
+        ip
+    ] = current
+
+    attempts = current[
+        "count"
+    ]
 
     threshold = int(
         config.get(
@@ -2073,152 +1262,206 @@ def handle_failed(
         )
     )
 
-    if failed_streak >= threshold:
+    log(
+        f"[SSH FAILED] "
+        f"IP={ip} "
+        f"user={username} "
+        f"attempt={attempts}/{threshold}"
+    )
 
-        block_ip(
+    if attempts < threshold:
+
+        return
+
+    blocks = load_blocks()
+
+    existing = blocks.get(
+        ip
+    )
+
+    if isinstance(
+        existing,
+        dict
+    ):
+
+        if existing.get(
+            "permanent",
+            False
+        ):
+
+            return
+
+        expires_at = existing.get(
+            "expires_at"
+        )
+
+        if expires_at:
+
+            try:
+
+                if int(
+                    expires_at
+                ) > int(
+                    time.time()
+                ):
+
+                    return
+
+            except Exception:
+
+                pass
+
+    if block_ip(
+        ip,
+        attempts,
+        config
+    ):
+
+        FAILED_ATTEMPTS.pop(
             ip,
-            failed_streak
+            None
         )
 
 
 # ============================================================
-# SSH LOG PARSER
+# HANDLE SUCCESSFUL LOGIN
 # ============================================================
 
-FAILED_REGEX = re.compile(
-    r"Failed \S+ for "
-    r"(?:invalid user )?"
-    r"(\S+) "
-    r"from "
-    r"([0-9a-fA-F:.]+)"
-)
+def handle_success_login(
+    username,
+    ip,
+    auth_method,
+    raw
+):
+
+    save_event(
+        "success",
+        ip,
+        username,
+        auth_method,
+        raw
+    )
+
+    update_stat(
+        "success"
+    )
+
+    if ip in FAILED_ATTEMPTS:
+
+        del FAILED_ATTEMPTS[
+            ip
+        ]
+
+        log(
+            f"[SSH SUCCESS] "
+            f"{ip} counter reset"
+        )
+
+    else:
+
+        log(
+            f"[SSH SUCCESS] "
+            f"{ip}"
+        )
 
 
-ACCEPTED_PASSWORD_REGEX = re.compile(
-    r"Accepted password for "
-    r"(\S+) "
-    r"from "
-    r"([0-9a-fA-F:.]+)"
-)
+# ============================================================
+# PROCESS LINE
+# ============================================================
 
-
-ACCEPTED_PUBLICKEY_REGEX = re.compile(
-    r"Accepted publickey for "
-    r"(\S+) "
-    r"from "
-    r"([0-9a-fA-F:.]+)"
-    r".*?"
-    r"ssh2(?::\s+\S+\s+)?"
-    r"(SHA256:[A-Za-z0-9+/=]+)"
-)
-
-
-def process_log_line(
+def process_line(
     line
 ):
 
-    # --------------------------------------------------------
-    # SUCCESSFUL PUBLIC KEY LOGIN
-    # --------------------------------------------------------
-
-    match = ACCEPTED_PUBLICKEY_REGEX.search(
-        line
-    )
-
-    if match:
-
-        username = match.group(
-            1
-        )
-
-        ip = match.group(
-            2
-        )
-
-        fingerprint = match.group(
-            3
-        )
-
-        if valid_ip(
-            ip
-        ):
-
-            handle_success(
-                username,
-                ip,
-                line.strip(),
-                "publickey",
-                fingerprint
-            )
+    if not line:
 
         return
 
     # --------------------------------------------------------
-    # SUCCESSFUL PASSWORD LOGIN
+    # SUCCESS
     # --------------------------------------------------------
 
-    match = ACCEPTED_PASSWORD_REGEX.search(
-        line
-    )
+    for pattern in SUCCESS_PATTERNS:
 
-    if match:
-
-        username = match.group(
-            1
+        match = pattern.search(
+            line
         )
 
-        ip = match.group(
-            2
-        )
+        if match:
 
-        if valid_ip(
-            ip
-        ):
-
-            handle_success(
-                username,
-                ip,
-                line.strip(),
-                "password",
-                None
+            username = match.group(
+                1
             )
 
-        return
+            ip = match.group(
+                2
+            )
 
-    # --------------------------------------------------------
-    # FAILED LOGIN
-    # --------------------------------------------------------
+            if "publickey" in line:
 
-    match = FAILED_REGEX.search(
-        line
-    )
+                auth_method = "publickey"
 
-    if match:
+            elif "keyboard-interactive" in line:
 
-        username = match.group(
-            1
-        )
+                auth_method = (
+                    "keyboard-interactive"
+                )
 
-        ip = match.group(
-            2
-        )
+            else:
 
-        if valid_ip(
-            ip
-        ):
+                auth_method = "password"
 
-            handle_failed(
+            handle_success_login(
+
                 username,
                 ip,
+                auth_method,
                 line.strip()
             )
 
+            return
+
+    # --------------------------------------------------------
+    # FAILED
+    # --------------------------------------------------------
+
+    for pattern in FAILED_PATTERNS:
+
+        match = pattern.search(
+            line
+        )
+
+        if not match:
+
+            continue
+
+        groups = match.groups()
+
+        if len(groups) >= 2:
+
+            username = groups[0]
+            ip = groups[1]
+
+        else:
+
+            username = "unknown"
+            ip = groups[0]
+
+        handle_failed_login(
+
+            username,
+            ip,
+            line.strip()
+        )
+
+        return
+
 
 # ============================================================
-# JOURNALCTL
+# JOURNAL PROCESS
 # ============================================================
 
-def start_journal():
+def run_journal():
 
     command = [
 
@@ -2227,269 +1470,176 @@ def start_journal():
         "-f",
 
         "-n",
-
         "0",
 
         "-u",
+        "ssh",
 
-        "ssh"
+        "-u",
+        "sshd",
+
+        "-o",
+        "cat"
     ]
 
-    return subprocess.Popen(
-
-        command,
-
-        stdout=subprocess.PIPE,
-
-        stderr=subprocess.STDOUT,
-
-        text=True,
-
-        bufsize=1
+    log(
+        "Starting SSH journal monitor..."
     )
+
+    while True:
+
+        process = None
+
+        try:
+
+            process = subprocess.Popen(
+
+                command,
+
+                stdout=subprocess.PIPE,
+
+                stderr=subprocess.STDOUT,
+
+                text=True,
+
+                bufsize=1
+            )
+
+            for line in process.stdout:
+
+                process_line(
+                    line
+                )
+
+                expire_blocks()
+
+        except KeyboardInterrupt:
+
+            if process:
+
+                process.terminate()
+
+            raise
+
+        except Exception as e:
+
+            log(
+                f"Journal error: {e}"
+            )
+
+        finally:
+
+            if process:
+
+                try:
+
+                    process.terminate()
+
+                except Exception:
+
+                    pass
+
+        log(
+            "SSH journal stopped. "
+            "Restarting in 3 seconds..."
+        )
+
+        time.sleep(
+            3
+        )
 
 
 # ============================================================
-# STORAGE INFORMATION
-# ============================================================
-
-def print_storage_info():
-
-    print(
-        f"[DATA] Events: {EVENTS_FILE}",
-        flush=True
-    )
-
-    print(
-        f"[DATA] Blocks: {BLOCKS_FILE}",
-        flush=True
-    )
-
-    print(
-        f"[DATA] IP statistics: {STATS_FILE}",
-        flush=True
-    )
-
-    print(
-        f"[DATA] Owner configuration: "
-        f"{OWNER_CONFIG_FILE}",
-        flush=True
-    )
-
-    print(
-        f"[DATA] Protection configuration: "
-        f"{PROTECTION_CONFIG_FILE}",
-        flush=True
-    )
-
-    print(
-        f"[DATA] Event retention: "
-        f"{EVENT_RETENTION_DAYS} days",
-        flush=True
-    )
-
-    print(
-        f"[DATA] Maximum events: "
-        f"{MAX_EVENTS}",
-        flush=True
-    )
-
-    print(
-        f"[DATA] IP statistics retention: "
-        f"{STATS_RETENTION_DAYS} days",
-        flush=True
-    )
-
-
-# ============================================================
-# PROTECTION INFORMATION
-# ============================================================
-
-def print_protection_config():
-
-    config = get_protection_config()
-
-    print(
-        "[PROTECTION] Configuration:",
-        flush=True
-    )
-
-    print(
-        f"[PROTECTION] Enabled: "
-        f"{config['enabled']}",
-        flush=True
-    )
-
-    print(
-        f"[PROTECTION] Attempts: "
-        f"{config['attempts']}",
-        flush=True
-    )
-
-    print(
-        f"[PROTECTION] Duration: "
-        f"{config['duration']} seconds",
-        flush=True
-    )
-
-    print(
-        f"[PROTECTION] Permanent: "
-        f"{config['permanent']}",
-        flush=True
-    )
-
-    print(
-        f"[PROTECTION] Mode: "
-        f"{config['mode']}",
-        flush=True
-    )
-
-    print(
-        f"[PROTECTION] Whitelist: "
-        f"{len(config['whitelist'])} IPs",
-        flush=True
-    )
-
-
-# ============================================================
-# MAIN LOOP
+# MAIN
 # ============================================================
 
 def main():
 
-    print(
-        "==================================================",
-        flush=True
+    ensure_directories()
+
+    log(
+        "========================================"
     )
 
-    print(
-        "ServerGuard SSH Protection",
-        flush=True
+    log(
+        "     ServerGuard Brute Force Guard"
     )
 
-    print(
-        "Protection mode: ACTIVE",
-        flush=True
+    log(
+        "========================================"
     )
 
-    print(
-        "Login tracking: SUCCESS + FAILED",
-        flush=True
+    config = load_protection_config()
+
+    log(
+        f"Protection: "
+        f"{'ON' if config['enabled'] else 'OFF'}"
     )
 
-    print(
-        "Blocking mode: DYNAMIC TELEGRAM CONFIGURATION",
-        flush=True
+    log(
+        f"Block after: "
+        f"{config['attempts']} failed attempts"
     )
 
-    print(
-        "Owner protection: SSH KEY FINGERPRINT",
-        flush=True
-    )
+    if config["permanent"]:
 
-    print(
-        "Password logging: DISABLED",
-        flush=True
-    )
-
-    print(
-        "==================================================",
-        flush=True
-    )
-
-    print_storage_info()
-
-    print_protection_config()
-
-    print(
-        f"[DATA] Loaded events: "
-        f"{len(events)}",
-        flush=True
-    )
-
-    print(
-        f"[DATA] Loaded blocks: "
-        f"{len(blocks)}",
-        flush=True
-    )
-
-    print(
-        f"[DATA] Loaded IP statistics: "
-        f"{len(ip_stats)}",
-        flush=True
-    )
-
-    print_owner_config()
-
-    rebuild_stats_from_events()
-
-    normalize_stats()
-
-    cleanup()
-
-    journal = start_journal()
-
-    last_cleanup = now()
-
-    try:
-
-        while True:
-
-            current_time = now()
-
-            if (
-                current_time
-                -
-                last_cleanup
-                >= CLEANUP_INTERVAL
-            ):
-
-                cleanup()
-
-                last_cleanup = current_time
-
-            line = journal.stdout.readline()
-
-            if line:
-
-                process_log_line(
-                    line
-                )
-
-            else:
-
-                time.sleep(
-                    0.2
-                )
-
-    except KeyboardInterrupt:
-
-        print(
-            "\n[STOP] ServerGuard protection stopped.",
-            flush=True
+        log(
+            "Block type: PERMANENT"
         )
 
-    except Exception as e:
+    else:
 
-        print(
-            f"[ERROR] Main loop: {e}",
-            flush=True
+        log(
+            f"Block type: TEMPORARY "
+            f"({config['duration']} seconds)"
         )
 
-    finally:
+    log(
+        f"Whitelist: "
+        f"{len(config['whitelist'])} IP(s)"
+    )
+
+    last_cleanup = 0
+
+    while True:
 
         try:
 
-            journal.terminate()
+            now = time.time()
 
-        except Exception:
+            if (
+                now - last_cleanup
+                >= CLEANUP_INTERVAL
+            ):
 
-            pass
+                expire_blocks()
 
+                cleanup_events()
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
+                cleanup_attempts()
+
+                last_cleanup = now
+
+            run_journal()
+
+        except KeyboardInterrupt:
+
+            log(
+                "Stopped."
+            )
+
+            break
+
+        except Exception as e:
+
+            log(
+                f"Fatal error: {e}"
+            )
+
+            time.sleep(
+                5
+            )
+
 
 if __name__ == "__main__":
 
