@@ -3,6 +3,8 @@
 import argparse
 import base64
 import hashlib
+import html
+import ipaddress
 import json
 import os
 import pwd
@@ -21,13 +23,25 @@ from pathlib import Path
 
 VERSION = "1.0.0"
 
-BASE_DIR = Path("/opt/serverguard")
-DATA_DIR = BASE_DIR / "data"
+BASE_DIR = Path(
+    "/opt/serverguard"
+)
 
-EVENTS_FILE = DATA_DIR / "ssh_key_events.json"
-STATE_FILE = DATA_DIR / "ssh_key_state.json"
+DATA_DIR = (
+    BASE_DIR / "data"
+)
 
-AUTHORIZED_KEYS_NAME = "authorized_keys"
+EVENTS_FILE = (
+    DATA_DIR / "ssh_key_events.json"
+)
+
+STATE_FILE = (
+    DATA_DIR / "ssh_key_state.json"
+)
+
+AUTHORIZED_KEYS_NAME = (
+    "authorized_keys"
+)
 
 DEFAULT_INTERVAL = 5
 
@@ -35,7 +49,49 @@ MAX_EVENTS = 5000
 
 
 # ============================================================
-# DIRECTORIES
+# AUDIT
+# ============================================================
+
+AUDIT_RULE_FILE = (
+    "/etc/audit/rules.d/serverguard-ssh-key.rules"
+)
+
+AUDIT_KEY = (
+    "serverguard_ssh_keys"
+)
+
+
+# ============================================================
+# KEY TYPES
+# ============================================================
+
+KEY_TYPES = (
+    "ssh-rsa",
+    "ssh-dss",
+
+    "ssh-ed25519",
+
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+    "sk-ssh-ed25519@openssh.com",
+
+    "ssh-rsa-cert-v01@openssh.com",
+    "ssh-ed25519-cert-v01@openssh.com",
+
+    "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+    "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+    "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+
+    "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com",
+    "sk-ssh-ed25519-cert-v01@openssh.com",
+)
+
+
+# ============================================================
+# INITIALIZATION
 # ============================================================
 
 DATA_DIR.mkdir(
@@ -49,17 +105,24 @@ DATA_DIR.mkdir(
 # ============================================================
 
 def utc_now():
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+    return (
+        datetime.now(
+            timezone.utc
+        )
+        .isoformat()
+    )
 
 
 def local_now():
-    return datetime.now().astimezone().isoformat()
+    return (
+        datetime.now()
+        .astimezone()
+        .isoformat()
+    )
 
 
 # ============================================================
-# COMMAND
+# COMMAND EXECUTION
 # ============================================================
 
 def run_command(
@@ -69,23 +132,26 @@ def run_command(
     try:
         result = subprocess.run(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            shell=isinstance(
+                command,
+                str
+            ),
+            capture_output=True,
             text=True,
             timeout=timeout
         )
 
         return (
             result.returncode,
-            result.stdout.strip(),
-            result.stderr.strip()
+            result.stdout,
+            result.stderr
         )
 
-    except Exception:
+    except Exception as exc:
         return (
             -1,
             "",
-            ""
+            str(exc)
         )
 
 
@@ -98,6 +164,8 @@ def load_json(
     default
 ):
     try:
+        path = Path(path)
+
         if not path.exists():
             return default
 
@@ -115,16 +183,22 @@ def save_json(
     path,
     data
 ):
-    temporary = path.with_suffix(
-        path.suffix + ".tmp"
+    path = Path(path)
+
+    temporary = Path(
+        str(path) + ".tmp"
     )
 
     try:
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
         with temporary.open(
             "w",
             encoding="utf-8"
         ) as file:
-
             json.dump(
                 data,
                 file,
@@ -137,12 +211,20 @@ def save_json(
             path
         )
 
-    except Exception:
+        return True
+
+    except Exception as exc:
+        print(
+            f"Failed to save {path}: {exc}"
+        )
+
         try:
             if temporary.exists():
                 temporary.unlink()
         except Exception:
             pass
+
+        return False
 
 
 # ============================================================
@@ -183,7 +265,7 @@ def save_event(event):
 
 
 # ============================================================
-# HASH
+# HASHING
 # ============================================================
 
 def sha256_bytes(data):
@@ -194,68 +276,40 @@ def sha256_bytes(data):
 
 def sha256_file(path):
     try:
-        data = path.read_bytes()
+        with open(
+            path,
+            "rb"
+        ) as file:
+            digest = hashlib.sha256()
 
-        return sha256_bytes(
-            data
-        )
+            while True:
+                chunk = file.read(
+                    1024 * 1024
+                )
+
+                if not chunk:
+                    break
+
+                digest.update(
+                    chunk
+                )
+
+            return digest.hexdigest()
 
     except Exception:
         return ""
 
 
-def make_event_id(
-    action,
-    path,
-    key,
-    old_key=None
-):
-    raw = (
-        str(time.time_ns())
-        + "|"
-        + str(os.getpid())
-        + "|"
-        + action
-        + "|"
-        + path
-        + "|"
-        + json.dumps(
-            key,
-            sort_keys=True,
-            ensure_ascii=False
-        )
-        + "|"
-        + json.dumps(
-            old_key,
-            sort_keys=True,
-            ensure_ascii=False
-        )
-    )
-
-    digest = hashlib.sha256(
-        raw.encode(
-            "utf-8",
-            errors="ignore"
-        )
-    ).hexdigest()
-
-    return (
-        str(int(time.time()))
-        + "-"
-        + str(os.getpid())
-        + "-"
-        + digest[:32]
-    )
-
-
 # ============================================================
-# USER
+# USERS
 # ============================================================
 
 def uid_to_username(uid):
     try:
+        uid = int(uid)
+
         return pwd.getpwuid(
-            int(uid)
+            uid
         ).pw_name
 
     except Exception:
@@ -263,55 +317,120 @@ def uid_to_username(uid):
 
 
 def get_file_owner(path):
+    path = Path(path)
+
     try:
         stat = path.stat()
 
+        uid = stat.st_uid
+        gid = stat.st_gid
+
+        username = uid_to_username(
+            uid
+        )
+
+        try:
+            import grp
+
+            group_name = grp.getgrgid(
+                gid
+            ).gr_name
+
+        except Exception:
+            group_name = str(gid)
+
         return {
-            "uid": stat.st_uid,
-            "user": uid_to_username(
-                stat.st_uid
-            ),
-            "gid": stat.st_gid,
-            "group": get_gid_name(
-                stat.st_gid
-            ),
-            "mode": oct(
-                stat.st_mode & 0o777
-            ),
-            "size": stat.st_size,
-            "mtime": datetime.fromtimestamp(
-                stat.st_mtime,
-                tz=timezone.utc
-            ).astimezone().isoformat(),
-            "ctime": datetime.fromtimestamp(
-                stat.st_ctime,
-                tz=timezone.utc
-            ).astimezone().isoformat()
+            "uid": uid,
+            "gid": gid,
+            "username": username,
+            "group": group_name
         }
 
     except Exception:
         return {
-            "uid": None,
-            "user": "",
-            "gid": None,
-            "group": "",
+            "uid": "",
+            "gid": "",
+            "username": "",
+            "group": ""
+        }
+
+
+# ============================================================
+# FILE METADATA
+# ============================================================
+
+def get_file_metadata(path):
+    path = Path(path)
+
+    if not path.exists():
+        return {
+            "exists": False,
+            "size": 0,
+            "inode": 0,
             "mode": "",
-            "size": None,
             "mtime": "",
-            "ctime": ""
+            "ctime": "",
+            "sha256": ""
         }
 
-
-def get_gid_name(gid):
     try:
-        import grp
+        stat = path.stat()
 
-        return grp.getgrgid(
-            int(gid)
-        ).gr_name
+        try:
+            mode = oct(
+                stat.st_mode
+                & 0o7777
+            )
+
+        except Exception:
+            mode = ""
+
+        try:
+            mtime = (
+                datetime.fromtimestamp(
+                    stat.st_mtime
+                )
+                .astimezone()
+                .isoformat()
+            )
+
+        except Exception:
+            mtime = ""
+
+        try:
+            ctime = (
+                datetime.fromtimestamp(
+                    stat.st_ctime
+                )
+                .astimezone()
+                .isoformat()
+            )
+
+        except Exception:
+            ctime = ""
+
+        return {
+            "exists": True,
+            "size": stat.st_size,
+            "inode": stat.st_ino,
+            "mode": mode,
+            "mtime": mtime,
+            "ctime": ctime,
+            "sha256": sha256_file(
+                path
+            )
+        }
 
     except Exception:
-        return str(gid)
+        return {
+            "exists": True,
+            "size": 0,
+            "inode": 0,
+            "mode": "",
+            "mtime": "",
+            "ctime": "",
+            "sha256": ""
+        }
 
 
 # ============================================================
@@ -319,143 +438,76 @@ def get_gid_name(gid):
 # ============================================================
 
 def get_home_directories():
-    result = []
+    accounts = []
 
     try:
-        with open(
-            "/etc/passwd",
-            "r",
-            encoding="utf-8",
-            errors="ignore"
-        ) as file:
-
-            for line in file:
-
-                parts = line.rstrip(
-                    "\n"
-                ).split(":")
-
-                if len(parts) < 7:
-                    continue
-
-                username = parts[0]
-                uid = parts[2]
-                home = parts[5]
-                shell = parts[6]
-
-                try:
-                    uid_int = int(uid)
-                except Exception:
-                    continue
-
-                if uid_int < 0:
-                    continue
-
-                if not home:
-                    continue
-
-                if home == "/nonexistent":
-                    continue
-
-                if not os.path.isdir(home):
-                    continue
-
-                ssh_dir = Path(
-                    home
-                ) / ".ssh"
-
-                authorized_keys = (
-                    ssh_dir
-                    / AUTHORIZED_KEYS_NAME
-                )
-
-                result.append({
-                    "username": username,
-                    "uid": uid_int,
-                    "home": home,
-                    "shell": shell,
-                    "ssh_dir": str(
-                        ssh_dir
-                    ),
-                    "authorized_keys": str(
-                        authorized_keys
-                    )
-                })
+        passwd_entries = pwd.getpwall()
 
     except Exception:
-        pass
+        return accounts
 
-    return result
+    for entry in passwd_entries:
 
+        username = entry.pw_name
+        uid = entry.pw_uid
+        home = entry.pw_dir
+        shell = entry.pw_shell
 
-# ============================================================
-# ROOT SSH KEY
-# ============================================================
+        if not home:
+            continue
 
-def get_root_account():
-    root_home = "/root"
+        if not home.startswith(
+            "/home/"
+        ) and home != "/root":
+            continue
 
-    ssh_dir = Path(
-        root_home
-    ) / ".ssh"
+        if uid < 0:
+            continue
 
-    authorized_keys = (
-        ssh_dir
-        / AUTHORIZED_KEYS_NAME
+        home_path = Path(
+            home
+        )
+
+        ssh_dir = (
+            home_path / ".ssh"
+        )
+
+        authorized_keys = (
+            ssh_dir / AUTHORIZED_KEYS_NAME
+        )
+
+        accounts.append(
+            {
+                "username": username,
+                "uid": uid,
+                "home": str(home_path),
+                "shell": shell,
+                "ssh": str(ssh_dir),
+                "authorized_keys": str(
+                    authorized_keys
+                )
+            }
+        )
+
+    accounts.sort(
+        key=lambda item: item[
+            "uid"
+        ]
     )
 
-    return {
-        "username": "root",
-        "uid": 0,
-        "home": root_home,
-        "shell": get_shell_for_user(
-            "root"
-        ),
-        "ssh_dir": str(
-            ssh_dir
-        ),
-        "authorized_keys": str(
-            authorized_keys
-        )
-    }
-
-
-def get_shell_for_user(
-    username
-):
-    try:
-        return pwd.getpwnam(
-            username
-        ).pw_shell
-
-    except Exception:
-        return ""
+    return accounts
 
 
 # ============================================================
-# AUTHORIZED KEYS
+# AUTHORIZED KEYS PARSER
 # ============================================================
-
-KEY_TYPES = (
-    "ssh-rsa",
-    "ssh-dss",
-    "ssh-ed25519",
-    "ecdsa-sha2-nistp256",
-    "ecdsa-sha2-nistp384",
-    "ecdsa-sha2-nistp521",
-    "sk-ssh-ed25519@openssh.com",
-    "sk-ecdsa-sha2-nistp256@openssh.com",
-    "rsa-sha2-256",
-    "rsa-sha2-512"
-)
-
 
 def parse_authorized_key_line(
     line,
     line_number
 ):
     original = line.rstrip(
-        "\n"
+        "\r\n"
     )
 
     stripped = original.strip()
@@ -463,7 +515,9 @@ def parse_authorized_key_line(
     if not stripped:
         return None
 
-    if stripped.startswith("#"):
+    if stripped.startswith(
+        "#"
+    ):
         return None
 
     parts = stripped.split()
@@ -471,69 +525,55 @@ def parse_authorized_key_line(
     if len(parts) < 2:
         return None
 
-    key_type = parts[0]
+    key_type_index = -1
 
-    # --------------------------------------------------------
-    # SSH authorized_keys options
-    # --------------------------------------------------------
-
-    options = ""
-
-    key_index = None
-
-    for index, part in enumerate(parts):
-
+    for index, part in enumerate(
+        parts
+    ):
         if part in KEY_TYPES:
-            key_index = index
+            key_type_index = index
             break
 
-    if key_index is None:
+    if key_type_index < 0:
         return None
 
-    if key_index > 0:
-        options = " ".join(
-            parts[:key_index]
-        )
+    if key_type_index + 1 >= len(parts):
+        return None
 
     key_type = parts[
-        key_index
+        key_type_index
     ]
-
-    if key_index + 1 >= len(parts):
-        return None
 
     key_data = parts[
-        key_index + 1
+        key_type_index + 1
     ]
 
-    comment = ""
+    comment_parts = parts[
+        key_type_index + 2:
+    ]
 
-    if len(parts) > key_index + 2:
-        comment = " ".join(
-            parts[
-                key_index + 2:
-            ]
-        )
+    comment = " ".join(
+        comment_parts
+    )
 
-    fingerprint = ""
+    options = " ".join(
+        parts[:key_type_index]
+    )
 
     try:
-        key_bytes = base64.b64decode(
-            key_data
-            + "=" * (
-                -len(key_data) % 4
-            )
+        decoded = base64.b64decode(
+            key_data.encode(
+                "ascii"
+            ),
+            validate=True
         )
-
-        digest = hashlib.sha256(
-            key_bytes
-        ).digest()
 
         fingerprint = (
             "SHA256:"
-            +
-            base64.b64encode(
-                digest
+            + base64.b64encode(
+                hashlib.sha256(
+                    decoded
+                ).digest()
             )
             .decode(
                 "ascii"
@@ -541,233 +581,158 @@ def parse_authorized_key_line(
             .rstrip("=")
         )
 
+        key_hash = hashlib.sha256(
+            decoded
+        ).hexdigest()
+
     except Exception:
         fingerprint = ""
 
-    option_flags = parse_key_options(
-        options
-    )
+        key_hash = ""
 
     return {
-        "line": line_number,
         "type": key_type,
-        "key": key_data,
+        "data": key_data,
         "fingerprint": fingerprint,
+        "sha256": key_hash,
         "comment": comment,
         "options": options,
-        "option_flags": option_flags
+        "line": line_number,
+        "raw": original
     }
 
 
-def parse_key_options(
-    options
-):
-    result = {
-        "from": "",
-        "command": "",
-        "environment": [],
-        "expiry_time": "",
-        "principals": "",
-        "cert_authority": False,
-        "no_agent_forwarding": False,
-        "no_port_forwarding": False,
-        "no_pty": False,
-        "no_user_rc": False,
-        "no_x11_forwarding": False,
-        "restrict": False
-    }
+def read_authorized_keys(path):
+    path = Path(path)
 
-    if not options:
-        return result
+    keys = []
 
-    parts = []
-
-    current = ""
-
-    inside_quotes = False
-
-    escape = False
-
-    for char in options:
-
-        if escape:
-            current += char
-            escape = False
-            continue
-
-        if char == "\\":
-            current += char
-            escape = True
-            continue
-
-        if char == '"':
-            inside_quotes = not inside_quotes
-            current += char
-            continue
-
-        if char == "," and not inside_quotes:
-            if current:
-                parts.append(
-                    current
-                )
-                current = ""
-            continue
-
-        current += char
-
-    if current:
-        parts.append(
-            current
-        )
-
-    for option in parts:
-
-        if option == "cert-authority":
-            result[
-                "cert_authority"
-            ] = True
-
-        elif option == "no-agent-forwarding":
-            result[
-                "no_agent_forwarding"
-            ] = True
-
-        elif option == "no-port-forwarding":
-            result[
-                "no_port_forwarding"
-            ] = True
-
-        elif option == "no-pty":
-            result[
-                "no_pty"
-            ] = True
-
-        elif option == "no-user-rc":
-            result[
-                "no_user_rc"
-            ] = True
-
-        elif option == "no-X11-forwarding":
-            result[
-                "no_x11_forwarding"
-            ] = True
-
-        elif option == "restrict":
-            result[
-                "restrict"
-            ] = True
-
-        elif option.startswith(
-            "from="
-        ):
-            result[
-                "from"
-            ] = option[
-                5:
-            ]
-
-        elif option.startswith(
-            "command="
-        ):
-            result[
-                "command"
-            ] = option[
-                8:
-            ]
-
-        elif option.startswith(
-            "environment="
-        ):
-            result[
-                "environment"
-            ].append(
-                option[
-                    12:
-                ]
-            )
-
-        elif option.startswith(
-            "expiry-time="
-        ):
-            result[
-                "expiry_time"
-            ] = option[
-                12:
-            ]
-
-        elif option.startswith(
-            "principals="
-        ):
-            result[
-                "principals"
-            ] = option[
-                11:
-            ]
-
-    return result
-
-
-def read_authorized_keys(
-    path
-):
-    result = []
+    if not path.exists():
+        return keys
 
     try:
-        if not path.exists():
-            return result
-
         with path.open(
             "r",
             encoding="utf-8",
-            errors="ignore"
+            errors="replace"
         ) as file:
 
             for line_number, line in enumerate(
                 file,
                 start=1
             ):
-
                 key = parse_authorized_key_line(
                     line,
                     line_number
                 )
 
                 if key is not None:
-                    result.append(
+                    keys.append(
                         key
                     )
 
     except Exception:
-        pass
+        return []
 
-    return result
+    return keys
 
 
 # ============================================================
 # KEY IDENTITY
 # ============================================================
 
-def key_identity(
-    key
-):
+def key_identity(key):
+    if not key:
+        return ""
+
+    fingerprint = key.get(
+        "fingerprint",
+        ""
+    )
+
+    if fingerprint:
+        return fingerprint
+
+    key_hash = key.get(
+        "sha256",
+        ""
+    )
+
+    if key_hash:
+        return key_hash
+
     return (
         key.get(
-            "fingerprint"
+            "type",
+            ""
         )
-        or
-        (
-            key.get(
-                "type",
-                ""
-            )
-            + ":"
-            +
-            key.get(
-                "key",
-                ""
-            )
+        + ":"
+        + key.get(
+            "data",
+            ""
         )
     )
+
+
+# ============================================================
+# SNAPSHOT
+# ============================================================
+
+def build_snapshot():
+    snapshot = {}
+
+    for account in get_home_directories():
+
+        path = Path(
+            account[
+                "authorized_keys"
+            ]
+        )
+
+        metadata = get_file_metadata(
+            path
+        )
+
+        keys = read_authorized_keys(
+            path
+        )
+
+        snapshot[str(path)] = {
+            "username": account[
+                "username"
+            ],
+
+            "uid": account[
+                "uid"
+            ],
+
+            "home": account[
+                "home"
+            ],
+
+            "shell": account[
+                "shell"
+            ],
+
+            "exists": path.exists(),
+
+            "sha256": (
+                metadata.get(
+                    "sha256",
+                    ""
+                )
+            ),
+
+            "metadata": metadata,
+
+            "owner": get_file_owner(
+                path
+            ),
+
+            "keys": keys
+        }
+
+    return snapshot
 
 
 # ============================================================
@@ -789,9 +754,7 @@ def load_state():
     return data
 
 
-def save_state(
-    state
-):
+def save_state(state):
     save_json(
         STATE_FILE,
         state
@@ -799,305 +762,168 @@ def save_state(
 
 
 # ============================================================
-# FILE SNAPSHOT
-# ============================================================
-
-def build_snapshot():
-    snapshot = {}
-
-    accounts = get_home_directories()
-
-    root_account = get_root_account()
-
-    root_exists = False
-
-    for account in accounts:
-        if account.get(
-            "username"
-        ) == "root":
-            root_exists = True
-            break
-
-    if not root_exists:
-        accounts.insert(
-            0,
-            root_account
-        )
-
-    for account in accounts:
-
-        path = Path(
-            account[
-                "authorized_keys"
-            ]
-        )
-
-        keys = read_authorized_keys(
-            path
-        )
-
-        snapshot[
-            str(path)
-        ] = {
-            "username": account[
-                "username"
-            ],
-            "uid": account[
-                "uid"
-            ],
-            "home": account[
-                "home"
-            ],
-            "shell": account[
-                "shell"
-            ],
-            "exists": path.exists(),
-            "sha256": sha256_file(
-                path
-            ),
-            "owner": get_file_owner(
-                path
-            ),
-            "keys": keys
-        }
-
-    return snapshot
-
-
-# ============================================================
 # PROCESS INFORMATION
 # ============================================================
 
-def process_info(
-    pid
-):
+def process_info(pid):
     result = {
-        "pid": pid,
+        "pid": "",
+        "ppid": "",
         "process": "",
-        "command": "",
-        "exe": "",
-        "user": "",
-        "uid": "",
-        "ppid": None,
         "parent_process": "",
-        "parent_command": "",
-        "start_time": ""
+        "exe": "",
+        "command": "",
+        "uid": "",
+        "username": ""
     }
 
-    if not pid:
+    if pid in (
+        None,
+        "",
+        0,
+        "0"
+    ):
         return result
 
     try:
-        pid_int = int(pid)
+        pid = int(pid)
+
     except Exception:
         return result
 
-    proc = Path(
-        "/proc"
-    ) / str(pid_int)
+    result["pid"] = pid
 
-    if not proc.exists():
+    proc_dir = Path(
+        f"/proc/{pid}"
+    )
+
+    if not proc_dir.exists():
         return result
 
-    # --------------------------------------------------------
-    # Process name
-    # --------------------------------------------------------
-
     try:
-        result[
-            "process"
-        ] = (
-            proc / "comm"
-        ).read_text(
-            encoding="utf-8",
-            errors="ignore"
-        ).strip()
-
-    except Exception:
-        pass
-
-    # --------------------------------------------------------
-    # Command line
-    # --------------------------------------------------------
-
-    try:
-        result[
-            "command"
-        ] = (
-            proc / "cmdline"
-        ).read_bytes().replace(
-            b"\x00",
-            b" "
-        ).decode(
-            "utf-8",
-            errors="ignore"
-        ).strip()
-
-    except Exception:
-        pass
-
-    # --------------------------------------------------------
-    # Executable
-    # --------------------------------------------------------
-
-    try:
-        result[
-            "exe"
-        ] = os.readlink(
-            str(
-                proc / "exe"
-            )
+        comm = (
+            proc_dir / "comm"
         )
 
-    except Exception:
-        pass
-
-    # --------------------------------------------------------
-    # Status
-    # --------------------------------------------------------
-
-    try:
-        status = (
-            proc / "status"
-        ).read_text(
-            encoding="utf-8",
-            errors="ignore"
-        )
-
-        for line in status.splitlines():
-
-            if line.startswith(
-                "Uid:"
-            ):
-
-                parts = line.split()
-
-                if len(parts) >= 2:
-
-                    result[
-                        "uid"
-                    ] = parts[1]
-
-                    result[
-                        "user"
-                    ] = uid_to_username(
-                        parts[1]
-                    )
-
-            elif line.startswith(
-                "PPid:"
-            ):
-
-                parts = line.split()
-
-                if len(parts) >= 2:
-
-                    result[
-                        "ppid"
-                    ] = int(
-                        parts[1]
-                    )
-
-    except Exception:
-        pass
-
-    # --------------------------------------------------------
-    # Parent
-    # --------------------------------------------------------
-
-    if result[
-        "ppid"
-    ]:
-
-        try:
-            parent_proc = (
-                Path("/proc")
-                /
-                str(
-                    result["ppid"]
-                )
-            )
-
+        if comm.exists():
             result[
-                "parent_process"
-            ] = (
-                parent_proc / "comm"
-            ).read_text(
+                "process"
+            ] = comm.read_text(
                 encoding="utf-8",
-                errors="ignore"
+                errors="replace"
             ).strip()
 
+    except Exception:
+        pass
+
+    try:
+        cmdline = (
+            proc_dir / "cmdline"
+        )
+
+        if cmdline.exists():
+            raw = cmdline.read_bytes()
+
             result[
-                "parent_command"
-            ] = (
-                parent_proc / "cmdline"
-            ).read_bytes().replace(
+                "command"
+            ] = raw.replace(
                 b"\x00",
                 b" "
             ).decode(
                 "utf-8",
-                errors="ignore"
+                errors="replace"
             ).strip()
 
-        except Exception:
-            pass
-
-    # --------------------------------------------------------
-    # Process start time
-    # --------------------------------------------------------
+    except Exception:
+        pass
 
     try:
-        stat = (
-            proc / "stat"
-        ).read_text(
-            encoding="utf-8",
-            errors="ignore"
+        exe = (
+            proc_dir / "exe"
         )
 
-        fields = stat.split()
-
-        if len(fields) > 21:
-
-            ticks = int(
-                fields[21]
+        if exe.exists():
+            result[
+                "exe"
+            ] = os.readlink(
+                str(exe)
             )
 
-            clock_ticks = os.sysconf(
-                os.sysconf_names[
-                    "SC_CLK_TCK"
-                ]
+    except Exception:
+        pass
+
+    try:
+        status = (
+            proc_dir / "status"
+        )
+
+        if status.exists():
+
+            text = status.read_text(
+                encoding="utf-8",
+                errors="replace"
             )
 
-            boot_time = time.time()
+            for line in text.splitlines():
 
-            with open(
-                "/proc/uptime",
-                "r",
-                encoding="utf-8"
-            ) as uptime_file:
+                if line.startswith(
+                    "PPid:"
+                ):
+                    result[
+                        "ppid"
+                    ] = int(
+                        line.split(
+                            ":",
+                            1
+                        )[1].strip()
+                    )
 
-                uptime = float(
-                    uptime_file.read().split()[0]
-                )
+                elif line.startswith(
+                    "Uid:"
+                ):
+                    fields = (
+                        line.split(
+                            ":",
+                            1
+                        )[1]
+                        .split()
+                    )
 
-            boot_time -= uptime
+                    if fields:
+                        result[
+                            "uid"
+                        ] = int(
+                            fields[0]
+                        )
 
-            process_start = (
-                boot_time
-                +
-                (
-                    ticks
-                    /
-                    clock_ticks
-                )
+    except Exception:
+        pass
+
+    if result[
+        "uid"
+    ] != "":
+        result[
+            "username"
+        ] = uid_to_username(
+            result["uid"]
+        )
+
+    try:
+        ppid = result[
+            "ppid"
+        ]
+
+        if ppid:
+            parent = process_info(
+                ppid
             )
 
             result[
-                "start_time"
-            ] = datetime.fromtimestamp(
-                process_start,
-                tz=timezone.utc
-            ).astimezone().isoformat()
+                "parent_process"
+            ] = parent.get(
+                "process",
+                ""
+            )
 
     except Exception:
         pass
@@ -1106,104 +932,89 @@ def process_info(
 
 
 # ============================================================
-# AUDITD
+# AUDITD AVAILABLE
 # ============================================================
 
-AUDIT_RULE_FILE = (
-    "/etc/audit/rules.d/"
-    "serverguard-ssh-key.rules"
-)
-
-
 def auditd_available():
-    try:
-        result = subprocess.run(
-            [
-                "sh",
-                "-c",
-                "command -v auditctl >/dev/null 2>&1"
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+    code, stdout, stderr = run_command(
+        [
+            "sh",
+            "-c",
+            "command -v auditctl"
+        ]
+    )
+
+    return (
+        code == 0
+        and bool(
+            stdout.strip()
         )
+    )
 
-        return result.returncode == 0
 
-    except Exception:
-        return False
-
+# ============================================================
+# AUDIT RULES
+# ============================================================
 
 def ensure_audit_rules():
     if os.geteuid() != 0:
+        print(
+            "Audit configuration requires root."
+        )
         return False
 
     if not auditd_available():
+        print(
+            "auditctl was not found."
+        )
         return False
 
     rules = []
 
-    # --------------------------------------------------------
-    # Root
-    # --------------------------------------------------------
-
-    rules.append(
-        "-w /root/.ssh/authorized_keys "
-        "-p wa "
-        "-k serverguard_ssh_keys"
+    root_key = Path(
+        "/root/.ssh/authorized_keys"
     )
 
-    # --------------------------------------------------------
-    # Existing home directories
-    # --------------------------------------------------------
-
-    for account in get_home_directories():
-
-        path = account.get(
-            "authorized_keys",
-            ""
-        )
-
-        if not path:
-            continue
-
-        if path == "/root/.ssh/authorized_keys":
-            continue
-
+    if root_key.exists() or root_key.parent.exists():
         rules.append(
-            "-w "
-            + path
-            + " "
+            "-w /root/.ssh/authorized_keys "
             "-p wa "
             "-k serverguard_ssh_keys"
         )
 
-    # --------------------------------------------------------
-    # Remove duplicates
-    # --------------------------------------------------------
+    for account in get_home_directories():
+
+        key_path = Path(
+            account[
+                "authorized_keys"
+            ]
+        )
+
+        ssh_dir = key_path.parent
+
+        if (
+            key_path.exists()
+            or ssh_dir.exists()
+        ):
+            rules.append(
+                f"-w {key_path} "
+                "-p wa "
+                "-k serverguard_ssh_keys"
+            )
 
     unique_rules = []
 
-    seen = set()
-
     for rule in rules:
+        if rule not in unique_rules:
+            unique_rules.append(
+                rule
+            )
 
-        if rule in seen:
-            continue
-
-        seen.add(
-            rule
+    if not unique_rules:
+        print(
+            "No SSH authorized_keys paths found."
         )
-
-        unique_rules.append(
-            rule
-        )
-
-    rules_text = (
-        "\n".join(
-            unique_rules
-        )
-        + "\n"
-    )
+        return False
 
     try:
         Path(
@@ -1213,14 +1024,30 @@ def ensure_audit_rules():
             exist_ok=True
         )
 
-        Path(
-            AUDIT_RULE_FILE
-        ).write_text(
-            rules_text,
+        with open(
+            AUDIT_RULE_FILE,
+            "w",
             encoding="utf-8"
-        )
+        ) as file:
 
-    except Exception:
+            file.write(
+                "# ServerGuard SSH Key Guard\n"
+            )
+
+            file.write(
+                "# Generated automatically\n\n"
+            )
+
+            for rule in unique_rules:
+                file.write(
+                    rule
+                    + "\n"
+                )
+
+    except Exception as exc:
+        print(
+            f"Failed to write audit rules: {exc}"
+        )
         return False
 
     code, stdout, stderr = run_command(
@@ -1232,233 +1059,323 @@ def ensure_audit_rules():
         timeout=10
     )
 
-    return code == 0
+    if code != 0:
+
+        print(
+            "Failed to load audit rules:"
+        )
+
+        if stderr:
+            print(
+                stderr.strip()
+            )
+
+        return False
+
+    print(
+        "Audit rules loaded successfully."
+    )
+
+    print(
+        f"Rules: {len(unique_rules)}"
+    )
+
+    return True
 
 
 # ============================================================
-# AUDIT LOG
+# AUDIT TIMESTAMP
 # ============================================================
 
-def parse_audit_timestamp(
-    line
-):
+def parse_audit_timestamp(line):
     match = re.search(
         r"msg=audit\((\d+)\.(\d+):(\d+)\)",
         line
     )
 
     if not match:
-        return ""
-
-    try:
-        timestamp = float(
-            match.group(1)
-            + "."
-            + match.group(2)
+        return (
+            "",
+            ""
         )
 
-        return datetime.fromtimestamp(
-            timestamp,
-            tz=timezone.utc
-        ).astimezone().isoformat()
+    seconds = int(
+        match.group(1)
+    )
+
+    fraction = match.group(2)
+
+    serial = match.group(3)
+
+    try:
+        timestamp = (
+            datetime.fromtimestamp(
+                seconds
+                + (
+                    int(fraction)
+                    / (
+                        10 ** len(fraction)
+                    )
+                ),
+                tz=timezone.utc
+            )
+            .astimezone()
+            .isoformat()
+        )
 
     except Exception:
+        timestamp = ""
+
+    return (
+        timestamp,
+        serial
+    )
+
+
+# ============================================================
+# AUDIT FIELD
+# ============================================================
+
+def extract_audit_field(
+    line,
+    name
+):
+    pattern = (
+        rf'(?:^|\s){re.escape(name)}='
+        rf'(?:"([^"]*)"|(\S+))'
+    )
+
+    match = re.search(
+        pattern,
+        line
+    )
+
+    if not match:
         return ""
 
+    if match.group(1) is not None:
+        return match.group(1)
+
+    return match.group(2)
+
+
+# ============================================================
+# AUDIT RECENT EVENTS
+# ============================================================
 
 def audit_recent_events(
     path=None
 ):
-    events = []
-
     if not auditd_available():
-        return events
+        return []
 
-    command = (
-        "ausearch "
-        "-k serverguard_ssh_keys "
-        "-ts recent "
-        "--raw "
-        "2>/dev/null"
-    )
+    command = [
+        "ausearch",
+        "-k",
+        AUDIT_KEY,
+        "-ts",
+        "recent",
+        "--raw"
+    ]
 
     code, stdout, stderr = run_command(
-        [
-            "sh",
-            "-c",
-            command
-        ],
+        command,
         timeout=10
     )
 
     if code != 0:
-        return events
+        return []
 
-    current = {}
+    groups = {}
 
     for line in stdout.splitlines():
 
         line = line.strip()
 
         if not line:
-
-            if current:
-
-                events.append(
-                    current
-                )
-
-                current = {}
-
             continue
 
-        timestamp = parse_audit_timestamp(
+        timestamp, serial = (
+            parse_audit_timestamp(
+                line
+            )
+        )
+
+        if not serial:
+            continue
+
+        if serial not in groups:
+            groups[serial] = {
+                "serial": serial,
+                "timestamp": timestamp,
+                "raw": []
+            }
+
+        groups[
+            serial
+        ][
+            "raw"
+        ].append(
             line
         )
 
-        if timestamp:
+    events = []
 
-            current[
-                "timestamp"
-            ] = timestamp
-
-        for key in (
-            "type",
-            "pid",
-            "ppid",
-            "uid",
-            "auid",
-            "ses",
-            "comm",
-            "exe",
-            "name",
-            "cwd",
-            "syscall",
-            "success",
-            "exit",
-            "addr",
-            "terminal"
-        ):
-
-            pattern = (
-                r"\b"
-                + re.escape(key)
-                + r"=([^\s]+)"
-            )
-
-            match = re.search(
-                pattern,
-                line
-            )
-
-            if match:
-
-                value = (
-                    match.group(1)
-                    .strip('"')
-                )
-
-                current[
-                    key
-                ] = value
-
-    if current:
-
-        events.append(
-            current
-        )
-
-    # --------------------------------------------------------
-    # Optional path filtering
-    # --------------------------------------------------------
+    target_path = ""
 
     if path:
-
-        filtered = []
-
-        path_string = str(
-            path
+        target_path = os.path.realpath(
+            str(path)
         )
 
-        for event in events:
+    for serial, group in groups.items():
 
-            name = event.get(
-                "name",
+        event = {
+            "serial": serial,
+            "timestamp": group.get(
+                "timestamp",
                 ""
+            ),
+            "type": "",
+            "pid": "",
+            "ppid": "",
+            "uid": "",
+            "auid": "",
+            "ses": "",
+            "comm": "",
+            "exe": "",
+            "name": "",
+            "cwd": "",
+            "syscall": "",
+            "success": "",
+            "exit": "",
+            "addr": "",
+            "terminal": "",
+            "raw": group.get(
+                "raw",
+                []
+            )
+        }
+
+        names = []
+
+        for line in group[
+            "raw"
+        ]:
+
+            record_type = (
+                extract_audit_field(
+                    line,
+                    "type"
+                )
             )
 
-            if not name:
-                filtered.append(
-                    event
+            if record_type:
+                event[
+                    "type"
+                ] = record_type
+
+            fields = (
+                "pid",
+                "ppid",
+                "uid",
+                "auid",
+                "ses",
+                "comm",
+                "exe",
+                "name",
+                "cwd",
+                "syscall",
+                "success",
+                "exit",
+                "addr",
+                "terminal"
+            )
+
+            for field in fields:
+
+                value = (
+                    extract_audit_field(
+                        line,
+                        field
+                    )
                 )
+
+                if value:
+                    if field == "name":
+                        names.append(
+                            value
+                        )
+                    else:
+                        event[
+                            field
+                        ] = value
+
+        if names:
+            event[
+                "names"
+            ] = names
+
+            event[
+                "name"
+            ] = names[-1]
+
+        if target_path:
+
+            matching = False
+
+            for name in names:
+
+                try:
+                    normalized = os.path.realpath(
+                        name
+                    )
+
+                    if normalized == target_path:
+                        matching = True
+                        break
+
+                except Exception:
+                    pass
+
+                if name == str(path):
+                    matching = True
+                    break
+
+            if not matching:
                 continue
 
-            if name == path_string:
-                filtered.append(
-                    event
-                )
+        events.append(
+            event
+        )
 
-        if filtered:
-            return filtered
+    events.sort(
+        key=lambda item: item.get(
+            "timestamp",
+            ""
+        ),
+        reverse=True
+    )
 
     return events
 
 
-def find_audit_context(
-    path,
-    before_events=None
-):
-    events = audit_recent_events(
-        path
-    )
-
-    if not events:
-        return {}
-
-    if before_events is None:
-        before_events = []
-
-    old_signatures = set()
-
-    for event in before_events:
-
-        signature = json.dumps(
-            event,
-            sort_keys=True
-        )
-
-        old_signatures.add(
-            signature
-        )
-
-    for event in reversed(
-        events
-    ):
-
-        signature = json.dumps(
-            event,
-            sort_keys=True
-        )
-
-        if signature in old_signatures:
-            continue
-
-        return normalize_audit_event(
-            event
-        )
-
-    if events:
-
-        return normalize_audit_event(
-            events[-1]
-        )
-
-    return {}
-
+# ============================================================
+# AUDIT CONTEXT
+# ============================================================
 
 def normalize_audit_event(
     event
 ):
+    pid = event.get(
+        "pid",
+        ""
+    )
+
+    process = process_info(
+        pid
+    )
+
     uid = event.get(
         "uid",
         ""
@@ -1469,160 +1386,231 @@ def normalize_audit_event(
         ""
     )
 
-    result = {
+    try:
+        uid_int = int(uid)
+
+    except Exception:
+        uid_int = ""
+
+    try:
+        auid_int = int(auid)
+
+    except Exception:
+        auid_int = ""
+
+    username = ""
+
+    if uid_int != "":
+        if uid_int not in (
+            4294967295,
+            4294967294
+        ):
+            username = uid_to_username(
+                uid_int
+            )
+
+    auid_username = ""
+
+    if auid_int != "":
+        if auid_int not in (
+            4294967295,
+            4294967294
+        ):
+            auid_username = uid_to_username(
+                auid_int
+            )
+
+    if not username:
+        username = process.get(
+            "username",
+            ""
+        )
+
+    source_ip = event.get(
+        "addr",
+        ""
+    )
+
+    if source_ip:
+        try:
+            ipaddress.ip_address(
+                source_ip
+            )
+
+        except Exception:
+            source_ip = ""
+
+    success = event.get(
+        "success",
+        ""
+    )
+
+    command = process.get(
+        "command",
+        ""
+    )
+
+    if not command:
+        command = event.get(
+            "comm",
+            ""
+        )
+
+    return {
         "timestamp": event.get(
             "timestamp",
             ""
         ),
-        "pid": event.get(
-            "pid",
+
+        "serial": event.get(
+            "serial",
             ""
         ),
-        "ppid": event.get(
-            "ppid",
-            ""
-        ),
+
         "uid": uid,
-        "user": (
-            uid_to_username(uid)
-            if str(uid).isdigit()
-            else ""
-        ),
+
+        "username": username,
+
         "auid": auid,
-        "audit_user": (
-            uid_to_username(auid)
-            if str(auid).isdigit()
-            and auid != "4294967295"
-            else ""
+
+        "auid_username": auid_username,
+
+        "pid": process.get(
+            "pid",
+            pid
         ),
-        "session": event.get(
-            "ses",
+
+        "ppid": process.get(
+            "ppid",
+            event.get(
+                "ppid",
+                ""
+            )
+        ),
+
+        "process": (
+            process.get(
+                "process",
+                ""
+            )
+            or event.get(
+                "comm",
+                ""
+            )
+        ),
+
+        "parent_process": process.get(
+            "parent_process",
             ""
         ),
-        "process": event.get(
-            "comm",
-            ""
+
+        "exe": (
+            process.get(
+                "exe",
+                ""
+            )
+            or event.get(
+                "exe",
+                ""
+            )
         ),
-        "exe": event.get(
-            "exe",
-            ""
-        ),
-        "command": "",
+
+        "command": command,
+
         "cwd": event.get(
             "cwd",
             ""
         ),
-        "source_ip": event.get(
-            "addr",
-            ""
-        ),
+
+        "source_ip": source_ip,
+
         "terminal": event.get(
             "terminal",
             ""
         ),
-        "success": event.get(
-            "success",
-            ""
-        ),
-        "exit": event.get(
-            "exit",
-            ""
-        ),
+
+        "success": success,
+
         "syscall": event.get(
             "syscall",
             ""
         ),
-        "name": event.get(
-            "name",
+
+        "exit": event.get(
+            "exit",
             ""
         )
     }
 
-    pid = result[
-        "pid"
-    ]
 
-    if pid:
+def find_audit_context(
+    path,
+    before_events=None
+):
+    if before_events is None:
+        events = audit_recent_events(
+            path
+        )
+    else:
+        events = before_events
 
-        proc = process_info(
-            pid
+    if not events:
+        return {}
+
+    target_path = os.path.realpath(
+        str(path)
+    )
+
+    candidates = []
+
+    for event in events:
+
+        names = event.get(
+            "names",
+            []
         )
 
-        if proc.get(
-            "command"
-        ):
-            result[
-                "command"
-            ] = proc[
-                "command"
-            ]
+        matched = False
 
-        if not result[
-            "process"
-        ]:
-            result[
-                "process"
-            ] = proc.get(
-                "process",
-                ""
-            )
+        for name in names:
 
-        if not result[
-            "exe"
-        ]:
-            result[
-                "exe"
-            ] = proc.get(
-                "exe",
-                ""
-            )
+            try:
+                if os.path.realpath(
+                    name
+                ) == target_path:
+                    matched = True
+                    break
 
-        if not result[
-            "ppid"
-        ]:
-            result[
-                "ppid"
-            ] = proc.get(
-                "ppid",
-                ""
-            )
+            except Exception:
+                pass
 
-        if not result[
-            "user"
-        ]:
-            result[
-                "user"
-            ] = proc.get(
-                "user",
-                ""
-            )
+        if not matched:
+            continue
 
-        result[
-            "process_start"
-        ] = proc.get(
-            "start_time",
+        normalized = normalize_audit_event(
+            event
+        )
+
+        candidates.append(
+            normalized
+        )
+
+    if not candidates:
+        return {}
+
+    candidates.sort(
+        key=lambda item: item.get(
+            "timestamp",
             ""
-        )
+        ),
+        reverse=True
+    )
 
-        result[
-            "parent_process"
-        ] = proc.get(
-            "parent_process",
-            ""
-        )
-
-        result[
-            "parent_command"
-        ] = proc.get(
-            "parent_command",
-            ""
-        )
-
-    return result
+    return candidates[0]
 
 
 # ============================================================
-# SSH CONNECTION
+# SSH SESSIONS
 # ============================================================
 
 def get_current_ssh_sessions():
@@ -1644,6 +1632,9 @@ def get_current_ssh_sessions():
         if "ESTAB" not in line:
             continue
 
+        if ":22" not in line:
+            continue
+
         parts = line.split()
 
         if len(parts) < 5:
@@ -1652,26 +1643,48 @@ def get_current_ssh_sessions():
         local_address = parts[3]
         remote_address = parts[4]
 
-        if (
-            ":22" not in local_address
-            and
-            ":ssh" not in local_address
+        remote_ip = remote_address
+
+        if remote_address.startswith(
+            "["
         ):
-            continue
-
-        process_text = ""
-
-        if len(parts) >= 6:
-
-            process_text = " ".join(
-                parts[5:]
+            match = re.match(
+                r"\[([^\]]+)\]:\d+$",
+                remote_address
             )
 
-        sessions.append({
-            "local": local_address,
-            "remote": remote_address,
-            "process": process_text
-        })
+            if match:
+                remote_ip = match.group(1)
+
+        else:
+            if remote_address.count(
+                ":"
+            ) == 1:
+                remote_ip = (
+                    remote_address
+                    .rsplit(
+                        ":",
+                        1
+                    )[0]
+                )
+
+        process = ""
+
+        if "users:(" in line:
+            process = line[
+                line.find(
+                    "users:("
+                ):
+            ]
+
+        sessions.append(
+            {
+                "local": local_address,
+                "remote": remote_address,
+                "remote_ip": remote_ip,
+                "process": process
+            }
+        )
 
     return sessions
 
@@ -1681,158 +1694,13 @@ def find_ssh_source_ip():
 
     for session in sessions:
 
-        remote = session.get(
-            "remote",
+        ip = session.get(
+            "remote_ip",
             ""
         )
 
-        if not remote:
-            continue
-
-        # ----------------------------------------------------
-        # IPv4
-        # ----------------------------------------------------
-
-        if "." in remote:
-
-            remote = remote.rsplit(
-                ":",
-                1
-            )[0]
-
-            return remote
-
-        # ----------------------------------------------------
-        # IPv6
-        # ----------------------------------------------------
-
-        if remote.startswith(
-            "["
-        ):
-
-            remote = remote[
-                1:
-            ]
-
-            if "]" in remote:
-
-                remote = remote.split(
-                    "]",
-                    1
-                )[0]
-
-            return remote
-
-    return ""
-
-
-# ============================================================
-# SSH AUTH LOG
-# ============================================================
-
-def get_recent_ssh_auth_events(
-    minutes=10
-):
-    result = []
-
-    commands = [
-        [
-            "journalctl",
-            "-u",
-            "ssh",
-            "--since",
-            f"{minutes} minutes ago",
-            "--no-pager",
-            "-o",
-            "short-iso"
-        ],
-        [
-            "journalctl",
-            "-u",
-            "sshd",
-            "--since",
-            f"{minutes} minutes ago",
-            "--no-pager",
-            "-o",
-            "short-iso"
-        ]
-    ]
-
-    seen = set()
-
-    for command in commands:
-
-        code, stdout, stderr = run_command(
-            command,
-            timeout=8
-        )
-
-        if code != 0:
-            continue
-
-        for line in stdout.splitlines():
-
-            if not line:
-                continue
-
-            if (
-                "Accepted " not in line
-                and
-                "authentication" not in line.lower()
-                and
-                "session opened" not in line.lower()
-            ):
-                continue
-
-            if line in seen:
-                continue
-
-            seen.add(
-                line
-            )
-
-            result.append(
-                line
-            )
-
-    return result[-20:]
-
-
-def find_auth_source_ip(
-    username=""
-):
-    lines = get_recent_ssh_auth_events(
-        15
-    )
-
-    ipv4_pattern = re.compile(
-        r"(?:from\s+)(\d{1,3}(?:\.\d{1,3}){3})"
-    )
-
-    ipv6_pattern = re.compile(
-        r"(?:from\s+)([0-9a-fA-F:]+)"
-    )
-
-    for line in reversed(
-        lines
-    ):
-
-        if username and username not in line:
-            continue
-
-        match = ipv4_pattern.search(
-            line
-        )
-
-        if match:
-            return match.group(1)
-
-        match = ipv6_pattern.search(
-            line
-        )
-
-        if match:
-            return match.group(1)
+        if ip:
+            return ip
 
     return ""
 
@@ -1841,82 +1709,89 @@ def find_auth_source_ip(
 # GEOIP
 # ============================================================
 
-def geoip(
-    ip
-):
+def geoip(ip):
     if not ip:
         return {}
 
-    if ip in (
-        "127.0.0.1",
-        "::1",
-        "localhost"
-    ):
-        return {}
-
     try:
-
-        code, stdout, stderr = run_command(
-            [
-                "curl",
-                "-L",
-                "--max-time",
-                "4",
-                "-s",
-                f"https://ipinfo.io/{ip}/json"
-            ],
-            timeout=6
+        address = ipaddress.ip_address(
+            ip
         )
 
-        if code != 0:
+        if (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+        ):
             return {}
-
-        data = json.loads(
-            stdout
-        )
-
-        return {
-            "country": data.get(
-                "country",
-                ""
-            ),
-            "region": data.get(
-                "region",
-                ""
-            ),
-            "city": data.get(
-                "city",
-                ""
-            ),
-            "organization": data.get(
-                "org",
-                ""
-            ),
-            "hostname": data.get(
-                "hostname",
-                ""
-            ),
-            "timezone": data.get(
-                "timezone",
-                ""
-            ),
-            "loc": data.get(
-                "loc",
-                ""
-            )
-        }
 
     except Exception:
         return {}
 
+    url = (
+        "https://ipinfo.io/"
+        + ip
+        + "/json"
+    )
+
+    code, stdout, stderr = run_command(
+        [
+            "curl",
+            "-L",
+            "--max-time",
+            "4",
+            "-s",
+            url
+        ],
+        timeout=6
+    )
+
+    if code != 0:
+        return {}
+
+    try:
+        data = json.loads(
+            stdout
+        )
+
+    except Exception:
+        return {}
+
+    return {
+        "country": data.get(
+            "country",
+            ""
+        ),
+
+        "region": data.get(
+            "region",
+            ""
+        ),
+
+        "city": data.get(
+            "city",
+            ""
+        ),
+
+        "org": data.get(
+            "org",
+            ""
+        ),
+
+        "hostname": data.get(
+            "hostname",
+            ""
+        )
+    }
+
 
 # ============================================================
-# FILE DIFFERENCE
+# KEY COMPARISON
 # ============================================================
 
-def map_keys(
-    keys
-):
+def map_keys(keys):
     result = {}
 
     for key in keys:
@@ -1925,9 +1800,10 @@ def map_keys(
             key
         )
 
-        result[
-            identity
-        ] = key
+        if identity:
+            result[
+                identity
+            ] = key
 
     return result
 
@@ -1951,7 +1827,6 @@ def compare_keys(
     for identity, key in new_map.items():
 
         if identity not in old_map:
-
             added.append(
                 key
             )
@@ -1959,7 +1834,6 @@ def compare_keys(
     for identity, key in old_map.items():
 
         if identity not in new_map:
-
             removed.append(
                 key
             )
@@ -1968,43 +1842,6 @@ def compare_keys(
         added,
         removed
     )
-
-
-# ============================================================
-# KEY METADATA
-# ============================================================
-
-def get_key_metadata(
-    key
-):
-    if not key:
-        return {}
-
-    return {
-        "type": key.get(
-            "type",
-            ""
-        ),
-        "fingerprint": key.get(
-            "fingerprint",
-            ""
-        ),
-        "comment": key.get(
-            "comment",
-            ""
-        ),
-        "line": key.get(
-            "line"
-        ),
-        "options": key.get(
-            "options",
-            ""
-        ),
-        "option_flags": key.get(
-            "option_flags",
-            {}
-        )
-    }
 
 
 # ============================================================
@@ -2022,56 +1859,75 @@ def create_event(
     if audit_context is None:
         audit_context = {}
 
-    # --------------------------------------------------------
-    # Source IP
-    # --------------------------------------------------------
-
     source_ip = (
         audit_context.get(
             "source_ip"
         )
-        or
-        find_auth_source_ip(
-            account.get(
-                "username",
-                ""
-            )
-        )
-        or
-        find_ssh_source_ip()
+        or find_ssh_source_ip()
+        or ""
     )
 
-    # --------------------------------------------------------
-    # GeoIP
-    # --------------------------------------------------------
+    if audit_context.get(
+        "source_ip"
+    ):
+        source_ip_source = (
+            "auditd"
+        )
 
-    geo = geoip(
+    elif source_ip:
+        source_ip_source = (
+            "active_ssh_session"
+        )
+
+    else:
+        source_ip_source = (
+            "unknown"
+        )
+
+    location = geoip(
         source_ip
     )
 
-    # --------------------------------------------------------
-    # File metadata
-    # --------------------------------------------------------
-
     file_path = Path(
         path
+    )
+
+    metadata = get_file_metadata(
+        file_path
     )
 
     owner = get_file_owner(
         file_path
     )
 
-    # --------------------------------------------------------
-    # Event
-    # --------------------------------------------------------
+    event_seed = (
+        str(action)
+        + "|"
+        + str(path)
+        + "|"
+        + json.dumps(
+            key,
+            sort_keys=True,
+            ensure_ascii=False
+        )
+        + "|"
+        + json.dumps(
+            old_key,
+            sort_keys=True,
+            ensure_ascii=False
+        )
+    )
+
+    event_id = (
+        f"{int(time.time())}-"
+        f"{os.getpid()}-"
+        f"{hashlib.sha256("
+        f"event_seed.encode('utf-8')"
+        f").hexdigest()[:16]}"
+    )
 
     event = {
-        "id": make_event_id(
-            action,
-            path,
-            key,
-            old_key
-        ),
+        "id": event_id,
 
         "version": VERSION,
 
@@ -2086,13 +1942,17 @@ def create_event(
                 "username",
                 ""
             ),
+
             "uid": account.get(
-                "uid"
+                "uid",
+                ""
             ),
+
             "home": account.get(
                 "home",
                 ""
             ),
+
             "shell": account.get(
                 "shell",
                 ""
@@ -2100,38 +1960,210 @@ def create_event(
         },
 
         "file": {
-            "path": path,
-            "exists": file_path.exists(),
-            "sha256": sha256_file(
-                file_path
-            ),
-            "owner": owner
+            "path": str(path),
+
+            "owner": owner,
+
+            "metadata": metadata
         },
 
-        "key": get_key_metadata(
-            key
+        "key": (
+            {
+                "type": key.get(
+                    "type",
+                    ""
+                ),
+
+                "fingerprint": key.get(
+                    "fingerprint",
+                    ""
+                ),
+
+                "sha256": key.get(
+                    "sha256",
+                    ""
+                ),
+
+                "comment": key.get(
+                    "comment",
+                    ""
+                ),
+
+                "line": key.get(
+                    "line",
+                    0
+                ),
+
+                "options": key.get(
+                    "options",
+                    ""
+                )
+            }
+            if key
+            else None
         ),
 
-        "old_key": get_key_metadata(
-            old_key
+        "old_key": (
+            {
+                "type": old_key.get(
+                    "type",
+                    ""
+                ),
+
+                "fingerprint": old_key.get(
+                    "fingerprint",
+                    ""
+                ),
+
+                "sha256": old_key.get(
+                    "sha256",
+                    ""
+                ),
+
+                "comment": old_key.get(
+                    "comment",
+                    ""
+                ),
+
+                "line": old_key.get(
+                    "line",
+                    0
+                ),
+
+                "options": old_key.get(
+                    "options",
+                    ""
+                )
+            }
+            if old_key
+            else None
         ),
 
-        "modifier": audit_context,
+        "modifier": {
+            "uid": audit_context.get(
+                "uid",
+                ""
+            ),
+
+            "username": audit_context.get(
+                "username",
+                ""
+            ),
+
+            "auid": audit_context.get(
+                "auid",
+                ""
+            ),
+
+            "auid_username": audit_context.get(
+                "auid_username",
+                ""
+            ),
+
+            "pid": audit_context.get(
+                "pid",
+                ""
+            ),
+
+            "ppid": audit_context.get(
+                "ppid",
+                ""
+            ),
+
+            "process": audit_context.get(
+                "process",
+                ""
+            ),
+
+            "parent_process": audit_context.get(
+                "parent_process",
+                ""
+            ),
+
+            "exe": audit_context.get(
+                "exe",
+                ""
+            ),
+
+            "command": audit_context.get(
+                "command",
+                ""
+            ),
+
+            "cwd": audit_context.get(
+                "cwd",
+                ""
+            ),
+
+            "success": audit_context.get(
+                "success",
+                ""
+            ),
+
+            "syscall": audit_context.get(
+                "syscall",
+                ""
+            ),
+
+            "exit": audit_context.get(
+                "exit",
+                ""
+            ),
+
+            "audit_serial": audit_context.get(
+                "serial",
+                ""
+            )
+        },
 
         "network": {
             "source_ip": source_ip,
-            "geo": geo
-        },
 
-        "authentication": {
-            "recent_ssh_events":
-                get_recent_ssh_auth_events(
-                    15
-                )
+            "source_ip_source": source_ip_source,
+
+            "country": location.get(
+                "country",
+                ""
+            ),
+
+            "region": location.get(
+                "region",
+                ""
+            ),
+
+            "city": location.get(
+                "city",
+                ""
+            ),
+
+            "org": location.get(
+                "org",
+                ""
+            ),
+
+            "hostname": location.get(
+                "hostname",
+                ""
+            ),
+
+            "terminal": audit_context.get(
+                "terminal",
+                ""
+            )
         },
 
         "server": {
             "hostname": socket.gethostname(),
+
+            "os": (
+                os.uname().sysname
+                if hasattr(
+                    os,
+                    "uname"
+                )
+                else ""
+            ),
+
             "kernel": (
                 os.uname().release
                 if hasattr(
@@ -2139,17 +2171,6 @@ def create_event(
                     "uname"
                 )
                 else ""
-            ),
-            "python": (
-                subprocess.run(
-                    [
-                        "python3",
-                        "--version"
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True
-                ).stdout.strip()
             )
         }
     }
@@ -2158,7 +2179,7 @@ def create_event(
 
 
 # ============================================================
-# INITIALIZATION
+# INITIALIZE BASELINE
 # ============================================================
 
 def initialize():
@@ -2166,8 +2187,11 @@ def initialize():
 
     state = {
         "version": VERSION,
+
         "created": local_now(),
+
         "last_scan": local_now(),
+
         "files": snapshot
     }
 
@@ -2176,27 +2200,28 @@ def initialize():
     )
 
     print(
-        "SSH Key Guard baseline created."
+        "SSH key baseline created."
     )
 
     print(
-        f"Tracked files: {len(snapshot)}"
+        f"Files monitored: {len(snapshot)}"
     )
 
     total_keys = 0
 
-    for data in snapshot.values():
-
+    for item in snapshot.values():
         total_keys += len(
-            data.get(
+            item.get(
                 "keys",
                 []
             )
         )
 
     print(
-        f"Tracked SSH keys: {total_keys}"
+        f"Keys found: {total_keys}"
     )
+
+    return True
 
 
 # ============================================================
@@ -2208,65 +2233,63 @@ def scan_once(
 ):
     state = load_state()
 
-    if not state.get(
-        "files"
-    ):
+    if not state or "files" not in state:
 
         if initialize_if_missing:
-
             initialize()
 
             return []
 
-    old_snapshot = state.get(
+        return []
+
+    old_files = state.get(
         "files",
         {}
     )
 
-    new_snapshot = build_snapshot()
+    new_files = build_snapshot()
 
-    generated_events = []
+    events = []
 
-    # --------------------------------------------------------
-    # Check current files
-    # --------------------------------------------------------
+    for path, new_info in new_files.items():
 
-    for path, new_data in new_snapshot.items():
-
-        old_data = old_snapshot.get(
+        old_info = old_files.get(
             path
         )
 
-        if old_data is None:
-
-            old_data = {
-                "username": new_data.get(
+        if old_info is None:
+            old_info = {
+                "username": new_info.get(
                     "username",
                     ""
                 ),
-                "uid": new_data.get(
-                    "uid"
+
+                "uid": new_info.get(
+                    "uid",
+                    ""
                 ),
-                "home": new_data.get(
+
+                "home": new_info.get(
                     "home",
                     ""
                 ),
-                "shell": new_data.get(
+
+                "shell": new_info.get(
                     "shell",
                     ""
                 ),
+
                 "exists": False,
-                "sha256": "",
-                "owner": {},
+
                 "keys": []
             }
 
-        old_keys = old_data.get(
+        old_keys = old_info.get(
             "keys",
             []
         )
 
-        new_keys = new_data.get(
+        new_keys = new_info.get(
             "keys",
             []
         )
@@ -2280,54 +2303,32 @@ def scan_once(
             continue
 
         account = {
-            "username": new_data.get(
+            "username": new_info.get(
                 "username",
                 ""
             ),
-            "uid": new_data.get(
-                "uid"
+
+            "uid": new_info.get(
+                "uid",
+                ""
             ),
-            "home": new_data.get(
+
+            "home": new_info.get(
                 "home",
                 ""
             ),
-            "shell": new_data.get(
+
+            "shell": new_info.get(
                 "shell",
                 ""
             )
         }
 
-        # ----------------------------------------------------
-        # Audit context
-        # ----------------------------------------------------
-
-        audit_context = {}
-
-        try:
-
-            before_audit = (
-                audit_recent_events(
-                    path
-                )
+        audit_context = (
+            find_audit_context(
+                path
             )
-
-            time.sleep(
-                0.1
-            )
-
-            audit_context = (
-                find_audit_context(
-                    path,
-                    before_audit
-                )
-            )
-
-        except Exception:
-            audit_context = {}
-
-        # ----------------------------------------------------
-        # Added keys
-        # ----------------------------------------------------
+        )
 
         for key in added:
 
@@ -2336,20 +2337,17 @@ def scan_once(
                 path,
                 account,
                 key,
-                audit_context=audit_context
+                None,
+                audit_context
             )
 
             save_event(
                 event
             )
 
-            generated_events.append(
+            events.append(
                 event
             )
-
-        # ----------------------------------------------------
-        # Removed keys
-        # ----------------------------------------------------
 
         for key in removed:
 
@@ -2357,503 +2355,30 @@ def scan_once(
                 "key_removed",
                 path,
                 account,
-                key=None,
-                old_key=key,
-                audit_context=audit_context
+                None,
+                key,
+                audit_context
             )
 
             save_event(
                 event
             )
 
-            generated_events.append(
+            events.append(
                 event
             )
 
-    # --------------------------------------------------------
-    # Detect new authorized_keys files
-    # --------------------------------------------------------
+    state["version"] = VERSION
 
-    for path, old_data in old_snapshot.items():
+    state["last_scan"] = local_now()
 
-        if path in new_snapshot:
-            continue
-
-        if not old_data.get(
-            "exists",
-            False
-        ):
-            continue
-
-        account = {
-            "username": old_data.get(
-                "username",
-                ""
-            ),
-            "uid": old_data.get(
-                "uid"
-            ),
-            "home": old_data.get(
-                "home",
-                ""
-            ),
-            "shell": old_data.get(
-                "shell",
-                ""
-            )
-        }
-
-        old_keys = old_data.get(
-            "keys",
-            []
-        )
-
-        for key in old_keys:
-
-            event = create_event(
-                "authorized_keys_removed",
-                path,
-                account,
-                key=None,
-                old_key=key
-            )
-
-            save_event(
-                event
-            )
-
-            generated_events.append(
-                event
-            )
-
-    # --------------------------------------------------------
-    # Save state
-    # --------------------------------------------------------
-
-    state = {
-        "version": VERSION,
-        "last_scan": local_now(),
-        "files": new_snapshot
-    }
+    state["files"] = new_files
 
     save_state(
         state
     )
 
-    return generated_events
-
-
-# ============================================================
-# FORMAT EVENT FOR LOG
-# ============================================================
-
-def format_event(
-    event
-):
-    lines = []
-
-    lines.append(
-        "========================================"
-    )
-
-    lines.append(
-        "SERVERGUARD SSH KEY EVENT"
-    )
-
-    lines.append(
-        "========================================"
-    )
-
-    lines.append(
-        f"Action: {event.get('action', '')}"
-    )
-
-    lines.append(
-        f"Time: {event.get('timestamp', '')}"
-    )
-
-    lines.append(
-        f"UTC: {event.get('timestamp_utc', '')}"
-    )
-
-    lines.append(
-        f"Event ID: {event.get('id', '')}"
-    )
-
-    # --------------------------------------------------------
-    # Account
-    # --------------------------------------------------------
-
-    account = event.get(
-        "account",
-        {}
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
-        "ACCOUNT"
-    )
-
-    lines.append(
-        f"User: {account.get('username', '')}"
-    )
-
-    lines.append(
-        f"UID: {account.get('uid', '')}"
-    )
-
-    lines.append(
-        f"Home: {account.get('home', '')}"
-    )
-
-    lines.append(
-        f"Shell: {account.get('shell', '')}"
-    )
-
-    # --------------------------------------------------------
-    # Key
-    # --------------------------------------------------------
-
-    key = event.get(
-        "key",
-        {}
-    )
-
-    old_key = event.get(
-        "old_key",
-        {}
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
-        "SSH KEY"
-    )
-
-    if key:
-
-        lines.append(
-            f"Type: {key.get('type', '')}"
-        )
-
-        lines.append(
-            f"Fingerprint: "
-            f"{key.get('fingerprint', '')}"
-        )
-
-        lines.append(
-            f"Comment: "
-            f"{key.get('comment', '')}"
-        )
-
-        lines.append(
-            f"Line: {key.get('line', '')}"
-        )
-
-        lines.append(
-            f"Options: "
-            f"{key.get('options', '')}"
-        )
-
-    if old_key:
-
-        lines.append(
-            f"Old type: "
-            f"{old_key.get('type', '')}"
-        )
-
-        lines.append(
-            f"Old fingerprint: "
-            f"{old_key.get('fingerprint', '')}"
-        )
-
-        lines.append(
-            f"Old comment: "
-            f"{old_key.get('comment', '')}"
-        )
-
-    # --------------------------------------------------------
-    # File
-    # --------------------------------------------------------
-
-    file_data = event.get(
-        "file",
-        {}
-    )
-
-    owner = file_data.get(
-        "owner",
-        {}
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
-        "FILE"
-    )
-
-    lines.append(
-        f"Path: "
-        f"{file_data.get('path', '')}"
-    )
-
-    lines.append(
-        f"SHA256: "
-        f"{file_data.get('sha256', '')}"
-    )
-
-    lines.append(
-        f"Owner: "
-        f"{owner.get('user', '')}"
-    )
-
-    lines.append(
-        f"UID: "
-        f"{owner.get('uid', '')}"
-    )
-
-    lines.append(
-        f"Group: "
-        f"{owner.get('group', '')}"
-    )
-
-    lines.append(
-        f"Mode: "
-        f"{owner.get('mode', '')}"
-    )
-
-    lines.append(
-        f"Size: "
-        f"{owner.get('size', '')}"
-    )
-
-    lines.append(
-        f"Modified: "
-        f"{owner.get('mtime', '')}"
-    )
-
-    lines.append(
-        f"Changed: "
-        f"{owner.get('ctime', '')}"
-    )
-
-    # --------------------------------------------------------
-    # Modifier
-    # --------------------------------------------------------
-
-    modifier = event.get(
-        "modifier",
-        {}
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
-        "MODIFIER / AUDIT"
-    )
-
-    lines.append(
-        f"User: "
-        f"{modifier.get('user', '')}"
-    )
-
-    lines.append(
-        f"Audit user: "
-        f"{modifier.get('audit_user', '')}"
-    )
-
-    lines.append(
-        f"UID: "
-        f"{modifier.get('uid', '')}"
-    )
-
-    lines.append(
-        f"AUID: "
-        f"{modifier.get('auid', '')}"
-    )
-
-    lines.append(
-        f"Session: "
-        f"{modifier.get('session', '')}"
-    )
-
-    lines.append(
-        f"Process: "
-        f"{modifier.get('process', '')}"
-    )
-
-    lines.append(
-        f"PID: "
-        f"{modifier.get('pid', '')}"
-    )
-
-    lines.append(
-        f"PPID: "
-        f"{modifier.get('ppid', '')}"
-    )
-
-    lines.append(
-        f"Executable: "
-        f"{modifier.get('exe', '')}"
-    )
-
-    lines.append(
-        f"Command: "
-        f"{modifier.get('command', '')}"
-    )
-
-    lines.append(
-        f"Parent process: "
-        f"{modifier.get('parent_process', '')}"
-    )
-
-    lines.append(
-        f"Parent command: "
-        f"{modifier.get('parent_command', '')}"
-    )
-
-    lines.append(
-        f"CWD: "
-        f"{modifier.get('cwd', '')}"
-    )
-
-    lines.append(
-        f"Syscall: "
-        f"{modifier.get('syscall', '')}"
-    )
-
-    lines.append(
-        f"Success: "
-        f"{modifier.get('success', '')}"
-    )
-
-    lines.append(
-        f"Exit: "
-        f"{modifier.get('exit', '')}"
-    )
-
-    lines.append(
-        f"Terminal: "
-        f"{modifier.get('terminal', '')}"
-    )
-
-    lines.append(
-        f"Audit timestamp: "
-        f"{modifier.get('timestamp', '')}"
-    )
-
-    # --------------------------------------------------------
-    # Network
-    # --------------------------------------------------------
-
-    network = event.get(
-        "network",
-        {}
-    )
-
-    geo = network.get(
-        "geo",
-        {}
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
-        "NETWORK"
-    )
-
-    lines.append(
-        f"Source IP: "
-        f"{network.get('source_ip', '')}"
-    )
-
-    if geo:
-
-        lines.append(
-            f"Country: "
-            f"{geo.get('country', '')}"
-        )
-
-        lines.append(
-            f"Region: "
-            f"{geo.get('region', '')}"
-        )
-
-        lines.append(
-            f"City: "
-            f"{geo.get('city', '')}"
-        )
-
-        lines.append(
-            f"Organization: "
-            f"{geo.get('organization', '')}"
-        )
-
-        lines.append(
-            f"Hostname: "
-            f"{geo.get('hostname', '')}"
-        )
-
-        lines.append(
-            f"Timezone: "
-            f"{geo.get('timezone', '')}"
-        )
-
-        lines.append(
-            f"Coordinates: "
-            f"{geo.get('loc', '')}"
-        )
-
-    # --------------------------------------------------------
-    # Server
-    # --------------------------------------------------------
-
-    server = event.get(
-        "server",
-        {}
-    )
-
-    lines.append(
-        ""
-    )
-
-    lines.append(
-        "SERVER"
-    )
-
-    lines.append(
-        f"Hostname: "
-        f"{server.get('hostname', '')}"
-    )
-
-    lines.append(
-        f"Kernel: "
-        f"{server.get('kernel', '')}"
-    )
-
-    lines.append(
-        f"Python: "
-        f"{server.get('python', '')}"
-    )
-
-    lines.append(
-        "========================================"
-    )
-
-    return "\n".join(
-        lines
-    )
+    return events
 
 
 # ============================================================
@@ -2868,7 +2393,7 @@ def monitor(
     )
 
     print(
-        "       SERVERGUARD SSH KEY GUARD"
+        "      SERVERGUARD SSH KEY GUARD"
     )
 
     print(
@@ -2880,58 +2405,79 @@ def monitor(
     )
 
     print(
-        f"Interval: {interval}s"
+        f"Interval: {interval} seconds"
     )
 
-    print(
-        f"Events: {EVENTS_FILE}"
-    )
-
-    print(
-        f"State: {STATE_FILE}"
-    )
-
-    print(
-        "========================================"
-    )
+    print()
 
     if os.geteuid() != 0:
 
         print(
-            "WARNING: SSH Key Guard should run as root."
+            "WARNING: SSH Key Guard is not running as root."
         )
 
-    if auditd_available():
+        print(
+            "Audit information may be incomplete."
+        )
 
-        if ensure_audit_rules():
-
-            print(
-                "auditd: enabled"
-            )
-
-        else:
-
-            print(
-                "auditd: rule installation failed"
-            )
+        print()
 
     else:
 
-        print(
-            "auditd: not available"
-        )
+        if auditd_available():
+            print(
+                "auditd: available"
+            )
+
+            ensure_audit_rules()
+
+        else:
+            print(
+                "auditd: not available"
+            )
 
     state = load_state()
 
-    if not state.get(
-        "files"
-    ):
+    if not state or "files" not in state:
+
+        print(
+            "No baseline found."
+        )
+
+        print(
+            "Creating baseline..."
+        )
 
         initialize()
+
+    print()
+
+    print(
+        "SSH Key Guard monitoring started."
+    )
+
+    print()
+
+    last_rules_refresh = time.time()
 
     while True:
 
         try:
+
+            now = time.time()
+
+            if (
+                os.geteuid() == 0
+                and auditd_available()
+                and now - last_rules_refresh >= 60
+            ):
+                try:
+                    ensure_audit_rules()
+
+                except Exception:
+                    pass
+
+                last_rules_refresh = now
 
             events = scan_once(
                 initialize_if_missing=False
@@ -2940,37 +2486,37 @@ def monitor(
             for event in events:
 
                 print(
-                    format_event(
-                        event
-                    )
+                    json.dumps(
+                        event,
+                        indent=2,
+                        ensure_ascii=False
+                    ),
+                    flush=True
                 )
 
             time.sleep(
-                max(
-                    1,
-                    interval
-                )
+                interval
             )
 
         except KeyboardInterrupt:
 
+            print()
+
             print(
-                "\nSSH Key Guard stopped."
+                "SSH Key Guard stopped."
             )
 
             break
 
-        except Exception as error:
+        except Exception as exc:
 
             print(
-                f"Monitor error: {error}"
+                f"Monitor error: {exc}",
+                flush=True
             )
 
             time.sleep(
-                max(
-                    1,
-                    interval
-                )
+                interval
             )
 
 
@@ -2986,119 +2532,299 @@ def show_events(
     if not events:
 
         print(
-            "No SSH key events."
+            "No SSH key events found."
         )
 
         return
+
+    try:
+        limit = int(
+            limit
+        )
+
+    except Exception:
+        limit = 20
+
+    if limit < 1:
+        limit = 20
 
     selected = events[
         -limit:
     ]
 
+    selected.reverse()
+
+    print(
+        "========================================"
+    )
+
+    print(
+        "          SSH KEY EVENTS"
+    )
+
+    print(
+        "========================================"
+    )
+
     for event in selected:
 
+        print()
+
         print(
-            format_event(
-                event
+            "----------------------------------------"
+        )
+
+        print(
+            f"ID: {event.get('id', '')}"
+        )
+
+        print(
+            f"Time: {event.get('timestamp', '')}"
+        )
+
+        print(
+            f"Action: {event.get('action', '')}"
+        )
+
+        account = event.get(
+            "account",
+            {}
+        )
+
+        print(
+            f"Account: {account.get('username', '')}"
+        )
+
+        print(
+            f"UID: {account.get('uid', '')}"
+        )
+
+        print(
+            f"Home: {account.get('home', '')}"
+        )
+
+        file_info = event.get(
+            "file",
+            {}
+        )
+
+        print(
+            f"File: {file_info.get('path', '')}"
+        )
+
+        owner = file_info.get(
+            "owner",
+            {}
+        )
+
+        print(
+            "File owner: "
+            f"{owner.get('username', '')}"
+        )
+
+        key = event.get(
+            "key"
+        )
+
+        old_key = event.get(
+            "old_key"
+        )
+
+        if key:
+
+            print(
+                f"Key type: {key.get('type', '')}"
             )
-        )
 
+            print(
+                "Fingerprint: "
+                f"{key.get('fingerprint', '')}"
+            )
 
-# ============================================================
-# SHOW AUDIT
-# ============================================================
+            print(
+                "Key SHA256: "
+                f"{key.get('sha256', '')}"
+            )
 
-def show_audit(
-    limit=20
-):
-    events = audit_recent_events()
+            print(
+                f"Comment: {key.get('comment', '')}"
+            )
 
-    if not events:
+            print(
+                f"Options: {key.get('options', '')}"
+            )
 
-        print(
-            "No recent audit events."
-        )
+            print(
+                f"Line: {key.get('line', '')}"
+            )
 
-        return
+        if old_key:
 
-    print(
-        "========================================"
-    )
+            print(
+                "Old key type: "
+                f"{old_key.get('type', '')}"
+            )
 
-    print(
-        "SERVERGUARD SSH KEY AUDIT"
-    )
+            print(
+                "Old fingerprint: "
+                f"{old_key.get('fingerprint', '')}"
+            )
 
-    print(
-        "========================================"
-    )
+            print(
+                "Old key SHA256: "
+                f"{old_key.get('sha256', '')}"
+            )
 
-    for event in events[
-        -limit:
-    ]:
+            print(
+                "Old comment: "
+                f"{old_key.get('comment', '')}"
+            )
 
-        print(
-            ""
-        )
+            print(
+                "Old options: "
+                f"{old_key.get('options', '')}"
+            )
 
-        print(
-            f"Timestamp: "
-            f"{event.get('timestamp', '')}"
-        )
-
-        print(
-            f"PID: "
-            f"{event.get('pid', '')}"
-        )
-
-        print(
-            f"PPID: "
-            f"{event.get('ppid', '')}"
-        )
-
-        print(
-            f"UID: "
-            f"{event.get('uid', '')}"
+        modifier = event.get(
+            "modifier",
+            {}
         )
 
         print(
-            f"AUID: "
-            f"{event.get('auid', '')}"
+            "Modifier:"
         )
 
         print(
-            f"Process: "
-            f"{event.get('comm', '')}"
+            f"  User: {modifier.get('username', '')}"
         )
 
         print(
-            f"Executable: "
-            f"{event.get('exe', '')}"
+            f"  UID: {modifier.get('uid', '')}"
         )
 
         print(
-            f"File: "
-            f"{event.get('name', '')}"
+            f"  AUID: {modifier.get('auid', '')}"
         )
 
         print(
-            f"Command/CWD: "
-            f"{event.get('cwd', '')}"
+            "  AUID user: "
+            f"{modifier.get('auid_username', '')}"
         )
 
         print(
-            f"Source IP: "
-            f"{event.get('addr', '')}"
+            f"  PID: {modifier.get('pid', '')}"
         )
 
         print(
-            f"Success: "
-            f"{event.get('success', '')}"
+            f"  PPID: {modifier.get('ppid', '')}"
         )
 
         print(
-            f"Syscall: "
-            f"{event.get('syscall', '')}"
+            f"  Process: {modifier.get('process', '')}"
+        )
+
+        print(
+            "  Parent process: "
+            f"{modifier.get('parent_process', '')}"
+        )
+
+        print(
+            f"  EXE: {modifier.get('exe', '')}"
+        )
+
+        print(
+            f"  Command: {modifier.get('command', '')}"
+        )
+
+        print(
+            f"  CWD: {modifier.get('cwd', '')}"
+        )
+
+        print(
+            f"  Success: {modifier.get('success', '')}"
+        )
+
+        print(
+            f"  Syscall: {modifier.get('syscall', '')}"
+        )
+
+        print(
+            f"  Exit: {modifier.get('exit', '')}"
+        )
+
+        network = event.get(
+            "network",
+            {}
+        )
+
+        print(
+            "Network:"
+        )
+
+        print(
+            f"  Source IP: {network.get('source_ip', '')}"
+        )
+
+        print(
+            "  Source: "
+            f"{network.get('source_ip_source', '')}"
+        )
+
+        print(
+            f"  Country: {network.get('country', '')}"
+        )
+
+        print(
+            f"  Region: {network.get('region', '')}"
+        )
+
+        print(
+            f"  City: {network.get('city', '')}"
+        )
+
+        print(
+            f"  Organization: {network.get('org', '')}"
+        )
+
+        print(
+            f"  Hostname: {network.get('hostname', '')}"
+        )
+
+        print(
+            f"  Terminal: {network.get('terminal', '')}"
+        )
+
+        metadata = file_info.get(
+            "metadata",
+            {}
+        )
+
+        print(
+            "File metadata:"
+        )
+
+        print(
+            f"  Size: {metadata.get('size', '')}"
+        )
+
+        print(
+            f"  Inode: {metadata.get('inode', '')}"
+        )
+
+        print(
+            f"  Mode: {metadata.get('mode', '')}"
+        )
+
+        print(
+            f"  Modified: {metadata.get('mtime', '')}"
+        )
+
+        print(
+            f"  Changed: {metadata.get('ctime', '')}"
+        )
+
+        print(
+            f"  SHA256: {metadata.get('sha256', '')}"
         )
 
         print(
@@ -3107,27 +2833,7 @@ def show_audit(
 
 
 # ============================================================
-# SCAN NOW
-# ============================================================
-
-def scan_command():
-    events = scan_once()
-
-    print(
-        f"New events: {len(events)}"
-    )
-
-    for event in events:
-
-        print(
-            format_event(
-                event
-            )
-        )
-
-
-# ============================================================
-# VERSION
+# SHOW VERSION
 # ============================================================
 
 def show_version():
@@ -3137,81 +2843,131 @@ def show_version():
 
 
 # ============================================================
-# STATUS
+# SHOW AUDIT STATUS
 # ============================================================
 
-def show_status():
-    state = load_state()
-
+def show_audit_status():
     print(
         "========================================"
     )
 
     print(
-        "SERVERGUARD SSH KEY GUARD STATUS"
+        "          SSH KEY AUDIT"
     )
 
     print(
         "========================================"
     )
 
-    print(
-        f"Version: {VERSION}"
-    )
-
-    print(
-        f"Running as UID: {os.geteuid()}"
-    )
-
-    print(
-        f"Data directory: {DATA_DIR}"
-    )
-
-    print(
-        f"Events file: {EVENTS_FILE}"
-    )
-
-    print(
-        f"State file: {STATE_FILE}"
-    )
-
-    print(
-        f"Auditd: "
-        f"{'available' if auditd_available() else 'not available'}"
-    )
-
-    print(
-        f"Tracked files: "
-        f"{len(state.get('files', {}))}"
-    )
-
-    total_keys = 0
-
-    for data in state.get(
-        "files",
-        {}
-    ).values():
-
-        total_keys += len(
-            data.get(
-                "keys",
-                []
-            )
+    if auditd_available():
+        print(
+            "auditctl: available"
+        )
+    else:
+        print(
+            "auditctl: unavailable"
         )
 
-    print(
-        f"Tracked SSH keys: "
-        f"{total_keys}"
+    rule_path = Path(
+        AUDIT_RULE_FILE
     )
 
-    print(
-        f"Last scan: "
-        f"{state.get('last_scan', '')}"
+    if rule_path.exists():
+
+        print(
+            f"Rules file: {rule_path}"
+        )
+
+        try:
+            text = rule_path.read_text(
+                encoding="utf-8"
+            )
+
+            print()
+            print(
+                text
+            )
+
+        except Exception:
+            pass
+
+    else:
+
+        print(
+            "Rules file: not found"
+        )
+
+
+# ============================================================
+# REMOVE AUDIT RULES
+# ============================================================
+
+def remove_audit_rules():
+    if os.geteuid() != 0:
+        print(
+            "Root privileges are required."
+        )
+        return False
+
+    if auditd_available():
+
+        code, stdout, stderr = run_command(
+            [
+                "auditctl",
+                "-l"
+            ],
+            timeout=10
+        )
+
+        if code == 0:
+
+            rules = stdout.splitlines()
+
+            for rule in rules:
+
+                if AUDIT_KEY not in rule:
+                    continue
+
+                match = re.search(
+                    r"^-w\s+(\S+)",
+                    rule
+                )
+
+                if not match:
+                    continue
+
+                watched_path = match.group(1)
+
+                run_command(
+                    [
+                        "auditctl",
+                        "-W",
+                        watched_path,
+                        "-p",
+                        "wa",
+                        "-k",
+                        AUDIT_KEY
+                    ],
+                    timeout=10
+                )
+
+    rule_path = Path(
+        AUDIT_RULE_FILE
     )
 
+    if rule_path.exists():
+
+        try:
+            rule_path.unlink()
+
+        except Exception:
+            pass
+
     print(
-        "========================================"
+        "SSH Key Guard audit rules removed."
     )
+
+    return True
 
 
 # ============================================================
@@ -3226,189 +2982,133 @@ def main():
         )
     )
 
-    parser.add_argument(
+    subparsers = parser.add_subparsers(
+        dest="command"
+    )
+
+    monitor_parser = subparsers.add_parser(
+        "monitor"
+    )
+
+    monitor_parser.add_argument(
         "--interval",
         type=int,
         default=DEFAULT_INTERVAL
     )
 
-    parser.add_argument(
-        "command",
-        nargs="?",
-        default=""
+    subparsers.add_parser(
+        "init"
     )
 
-    parser.add_argument(
-        "value",
-        nargs="?"
+    subparsers.add_parser(
+        "scan"
+    )
+
+    events_parser = subparsers.add_parser(
+        "events"
+    )
+
+    events_parser.add_argument(
+        "count",
+        nargs="?",
+        type=int,
+        default=20
+    )
+
+    subparsers.add_parser(
+        "audit"
+    )
+
+    subparsers.add_parser(
+        "audit-remove"
+    )
+
+    subparsers.add_parser(
+        "version"
     )
 
     args = parser.parse_args()
 
-    command = (
-        args.command
-        .strip()
-        .lower()
-    )
+    if args.command == "monitor":
 
-    # ========================================================
-    # MONITOR
-    # ========================================================
+        interval = args.interval
 
-    if command == "monitor":
+        if interval < 1:
+            interval = 1
 
         monitor(
-            max(
-                1,
-                args.interval
-            )
+            interval
         )
 
-    # ========================================================
-    # INITIALIZE
-    # ========================================================
+        return
 
-    elif command == "init":
+    if args.command == "init":
 
         initialize()
 
-    # ========================================================
-    # SCAN
-    # ========================================================
+        return
 
-    elif command == "scan":
+    if args.command == "scan":
 
-        scan_command()
+        events = scan_once(
+            initialize_if_missing=True
+        )
 
-    # ========================================================
-    # EVENTS
-    # ========================================================
+        if not events:
 
-    elif command == "events":
-
-        try:
-
-            limit = int(
-                args.value
-                or 20
+            print(
+                "No SSH key changes detected."
             )
 
-        except Exception:
+            return
 
-            limit = 20
+        for event in events:
+
+            print(
+                json.dumps(
+                    event,
+                    indent=2,
+                    ensure_ascii=False
+                )
+            )
+
+        return
+
+    if args.command == "events":
 
         show_events(
-            max(
-                1,
-                limit
-            )
+            args.count
         )
 
-    # ========================================================
-    # AUDIT
-    # ========================================================
+        return
 
-    elif command == "audit":
+    if args.command == "audit":
 
-        if ensure_audit_rules():
+        if os.geteuid() != 0:
 
             print(
-                "ServerGuard audit rules installed."
+                "Root privileges are required."
             )
 
-        else:
+            return
 
-            print(
-                "Failed to install audit rules."
-            )
+        show_audit_status()
 
-    # ========================================================
-    # AUDIT EVENTS
-    # ========================================================
+        return
 
-    elif command == "audit-events":
+    if args.command == "audit-remove":
 
-        try:
+        remove_audit_rules()
 
-            limit = int(
-                args.value
-                or 20
-            )
+        return
 
-        except Exception:
-
-            limit = 20
-
-        show_audit(
-            max(
-                1,
-                limit
-            )
-        )
-
-    # ========================================================
-    # STATUS
-    # ========================================================
-
-    elif command == "status":
-
-        show_status()
-
-    # ========================================================
-    # VERSION
-    # ========================================================
-
-    elif command == "version":
+    if args.command == "version":
 
         show_version()
 
-    # ========================================================
-    # HELP
-    # ========================================================
+        return
 
-    else:
-
-        print(
-            "ServerGuard SSH Key Guard"
-        )
-
-        print()
-
-        print(
-            "Commands:"
-        )
-
-        print(
-            "  init"
-        )
-
-        print(
-            "  scan"
-        )
-
-        print(
-            "  monitor"
-        )
-
-        print(
-            "  events [COUNT]"
-        )
-
-        print(
-            "  audit"
-        )
-
-        print(
-            "  audit-events [COUNT]"
-        )
-
-        print(
-            "  status"
-        )
-
-        print(
-            "  version"
-        )
+    parser.print_help()
 
 
 # ============================================================
