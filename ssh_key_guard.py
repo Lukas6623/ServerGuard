@@ -20,7 +20,7 @@ from pathlib import Path
 # SERVERGUARD SSH KEY GUARD
 # ============================================================
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 BASE_DIR = Path("/opt/serverguard")
 
@@ -277,6 +277,12 @@ def uid_to_username(uid):
     try:
         uid = int(uid)
 
+        if uid in (
+            4294967295,
+            4294967294
+        ):
+            return ""
+
         return pwd.getpwuid(
             uid
         ).pw_name
@@ -356,7 +362,8 @@ def get_file_metadata(path):
 
         try:
             mtime = datetime.fromtimestamp(
-                stat.st_mtime
+                stat.st_mtime,
+                tz=timezone.utc
             ).astimezone().isoformat()
 
         except Exception:
@@ -364,7 +371,8 @@ def get_file_metadata(path):
 
         try:
             ctime = datetime.fromtimestamp(
-                stat.st_ctime
+                stat.st_ctime,
+                tz=timezone.utc
             ).astimezone().isoformat()
 
         except Exception:
@@ -491,7 +499,9 @@ def parse_authorized_key_line(
     if key_type_index + 1 >= len(parts):
         return None
 
-    key_type = parts[key_type_index]
+    key_type = parts[
+        key_type_index
+    ]
 
     key_data = parts[
         key_type_index + 1
@@ -849,24 +859,27 @@ def auditd_available():
     )
 
 
+def ausearch_available():
+    code, stdout, stderr = run_command(
+        [
+            "sh",
+            "-c",
+            "command -v ausearch"
+        ]
+    )
+
+    return (
+        code == 0
+        and bool(stdout.strip())
+    )
+
+
 # ============================================================
-# AUDIT RULES
+# AUDIT RULE PATHS
 # ============================================================
 
-def ensure_audit_rules():
-    if os.geteuid() != 0:
-        print(
-            "Audit configuration requires root."
-        )
-        return False
-
-    if not auditd_available():
-        print(
-            "auditctl was not found."
-        )
-        return False
-
-    rules = []
+def get_authorized_keys_paths():
+    paths = []
 
     root_key = Path(
         "/root/.ssh/authorized_keys"
@@ -876,10 +889,8 @@ def ensure_audit_rules():
         root_key.exists()
         or root_key.parent.exists()
     ):
-        rules.append(
-            "-w /root/.ssh/authorized_keys "
-            "-p wa "
-            "-k serverguard_ssh_keys"
+        paths.append(
+            str(root_key)
         )
 
     for account in get_home_directories():
@@ -894,12 +905,111 @@ def ensure_audit_rules():
             key_path.exists()
             or ssh_dir.exists()
         ):
-            rules.append(
-                "-w {} -p wa -k {}".format(
-                    key_path,
-                    AUDIT_KEY
-                )
+            paths.append(
+                str(key_path)
             )
+
+    unique = []
+
+    for path in paths:
+
+        normalized = os.path.realpath(
+            path
+        )
+
+        if normalized not in unique:
+            unique.append(
+                normalized
+            )
+
+    return unique
+
+
+# ============================================================
+# AUDIT RULES
+# ============================================================
+
+def remove_live_audit_rules():
+    if not auditd_available():
+        return
+
+    code, stdout, stderr = run_command(
+        [
+            "auditctl",
+            "-l"
+        ],
+        timeout=10
+    )
+
+    if code != 0:
+        return
+
+    for line in stdout.splitlines():
+
+        if AUDIT_KEY not in line:
+            continue
+
+        match = re.search(
+            r"^-w\s+(\S+)",
+            line
+        )
+
+        if not match:
+            continue
+
+        watched_path = match.group(1)
+
+        run_command(
+            [
+                "auditctl",
+                "-W",
+                watched_path,
+                "-p",
+                "wa",
+                "-k",
+                AUDIT_KEY
+            ],
+            timeout=10
+        )
+
+
+def ensure_audit_rules():
+    if os.geteuid() != 0:
+
+        print(
+            "Audit configuration requires root."
+        )
+
+        return False
+
+    if not auditd_available():
+
+        print(
+            "auditctl was not found."
+        )
+
+        return False
+
+    paths = get_authorized_keys_paths()
+
+    if not paths:
+
+        print(
+            "No SSH authorized_keys paths found."
+        )
+
+        return False
+
+    rules = []
+
+    for path in paths:
+
+        rules.append(
+            "-w {} -p wa -k {}".format(
+                path,
+                AUDIT_KEY
+            )
+        )
 
     unique_rules = []
 
@@ -910,19 +1020,11 @@ def ensure_audit_rules():
                 rule
             )
 
-    if not unique_rules:
-
-        print(
-            "No SSH authorized_keys paths found."
-        )
-
-        return False
+    rule_path = Path(
+        AUDIT_RULE_FILE
+    )
 
     try:
-        rule_path = Path(
-            AUDIT_RULE_FILE
-        )
-
         rule_path.parent.mkdir(
             parents=True,
             exist_ok=True
@@ -938,10 +1040,17 @@ def ensure_audit_rules():
             )
 
             file.write(
-                "# Generated automatically\n\n"
+                "# Generated automatically\n"
+            )
+
+            file.write(
+                "# Audit key: {}\n\n".format(
+                    AUDIT_KEY
+                )
             )
 
             for rule in unique_rules:
+
                 file.write(
                     rule + "\n"
                 )
@@ -956,11 +1065,16 @@ def ensure_audit_rules():
 
         return False
 
+    # Remove currently loaded ServerGuard rules
+    # so we don't accumulate duplicates.
+    remove_live_audit_rules()
+
+    # Load new rules.
     code, stdout, stderr = run_command(
         [
             "auditctl",
             "-R",
-            AUDIT_RULE_FILE
+            str(rule_path)
         ],
         timeout=10
     )
@@ -978,13 +1092,39 @@ def ensure_audit_rules():
 
         return False
 
+    # Verify that the rules are actually loaded.
+    code, stdout, stderr = run_command(
+        [
+            "auditctl",
+            "-l"
+        ],
+        timeout=10
+    )
+
+    loaded_count = 0
+
+    if code == 0:
+
+        for line in stdout.splitlines():
+
+            if AUDIT_KEY in line:
+                loaded_count += 1
+
+    if loaded_count == 0:
+
+        print(
+            "Audit rules were not found after loading."
+        )
+
+        return False
+
     print(
         "Audit rules loaded successfully."
     )
 
     print(
         "Rules: {}".format(
-            len(unique_rules)
+            loaded_count
         )
     )
 
@@ -997,7 +1137,7 @@ def ensure_audit_rules():
 
 def parse_audit_timestamp(line):
     match = re.search(
-        r"msg=audit\((\d+)\.(\d+):(\d+)\)",
+        r"msg=audit\((\d+)(?:\.(\d+))?:(\d+)\)",
         line
     )
 
@@ -1011,19 +1151,24 @@ def parse_audit_timestamp(line):
         match.group(1)
     )
 
-    fraction = match.group(2)
+    fraction = match.group(2) or ""
 
     serial = match.group(3)
 
     try:
-        timestamp = datetime.fromtimestamp(
-            seconds
-            + (
+
+        fraction_value = 0
+
+        if fraction:
+            fraction_value = (
                 int(fraction)
                 / (
                     10 ** len(fraction)
                 )
-            ),
+            )
+
+        timestamp = datetime.fromtimestamp(
+            seconds + fraction_value,
             tz=timezone.utc
         ).astimezone().isoformat()
 
@@ -1065,11 +1210,64 @@ def extract_audit_field(
 
 
 # ============================================================
+# UNESCAPE AUDIT VALUE
+# ============================================================
+
+def decode_audit_value(value):
+    if not value:
+        return ""
+
+    value = value.strip()
+
+    if (
+        len(value) >= 2
+        and value[0] == '"'
+        and value[-1] == '"'
+    ):
+        value = value[1:-1]
+
+    replacements = (
+        ("\\x20", " "),
+        ("\\x09", "\t"),
+        ("\\x0a", "\n"),
+        ("\\x22", '"'),
+        ("\\x5c", "\\")
+    )
+
+    for old, new in replacements:
+        value = value.replace(
+            old,
+            new
+        )
+
+    return value
+
+
+# ============================================================
+# AUDIT RECORD TYPE
+# ============================================================
+
+def get_audit_record_type(line):
+    match = re.search(
+        r"(?:^|\s)type=(\S+)",
+        line
+    )
+
+    if not match:
+        return ""
+
+    return match.group(1)
+
+
+# ============================================================
 # AUDIT RECENT EVENTS
 # ============================================================
 
 def audit_recent_events(path=None):
     if not auditd_available():
+        return []
+
+    if not ausearch_available():
         return []
 
     command = [
@@ -1115,7 +1313,12 @@ def audit_recent_events(path=None):
                 "raw": []
             }
 
-        groups[serial]["raw"].append(
+        group = groups[serial]
+
+        if not group.get("timestamp"):
+            group["timestamp"] = timestamp
+
+        group["raw"].append(
             line
         )
 
@@ -1124,6 +1327,7 @@ def audit_recent_events(path=None):
     target_path = ""
 
     if path:
+
         target_path = os.path.realpath(
             str(path)
         )
@@ -1151,6 +1355,8 @@ def audit_recent_events(path=None):
             "exit": "",
             "addr": "",
             "terminal": "",
+            "arch": "",
+            "items": "",
             "raw": group.get(
                 "raw",
                 []
@@ -1159,15 +1365,30 @@ def audit_recent_events(path=None):
 
         names = []
 
+        record_types = []
+
         for line in group["raw"]:
 
-            record_type = extract_audit_field(
-                line,
-                "type"
+            record_type = get_audit_record_type(
+                line
             )
 
             if record_type:
-                event["type"] = record_type
+                record_types.append(
+                    record_type
+                )
+
+            timestamp, line_serial = (
+                parse_audit_timestamp(
+                    line
+                )
+            )
+
+            if (
+                timestamp
+                and not event["timestamp"]
+            ):
+                event["timestamp"] = timestamp
 
             fields = (
                 "pid",
@@ -1183,7 +1404,9 @@ def audit_recent_events(path=None):
                 "success",
                 "exit",
                 "addr",
-                "terminal"
+                "terminal",
+                "arch",
+                "items"
             )
 
             for field in fields:
@@ -1196,11 +1419,33 @@ def audit_recent_events(path=None):
                 if not value:
                     continue
 
+                value = decode_audit_value(
+                    value
+                )
+
                 if field == "name":
-                    names.append(value)
+
+                    names.append(
+                        value
+                    )
 
                 else:
-                    event[field] = value
+
+                    # Prefer SYSCALL values over other
+                    # records when available.
+                    if (
+                        not event.get(field)
+                        or record_type == "SYSCALL"
+                    ):
+                        event[field] = value
+
+        if record_types:
+
+            event["types"] = list(
+                dict.fromkeys(
+                    record_types
+                )
+            )
 
         if names:
 
@@ -1208,13 +1453,19 @@ def audit_recent_events(path=None):
 
             event["name"] = names[-1]
 
+        # Only return the audit event if it actually
+        # refers to the target authorized_keys file.
         if target_path:
 
             matching = False
 
             for name in names:
 
+                if not name:
+                    continue
+
                 try:
+
                     normalized = os.path.realpath(
                         name
                     )
@@ -1258,6 +1509,9 @@ def normalize_audit_event(event):
         ""
     )
 
+    # The process may already be gone by the time
+    # ausearch is called. Therefore /proc is only
+    # an optional enrichment source.
     process = process_info(
         pid
     )
@@ -1272,6 +1526,7 @@ def normalize_audit_event(event):
         ""
     )
 
+    # auditd normally returns numeric values in --raw mode.
     try:
         uid_int = int(uid)
 
@@ -1293,6 +1548,7 @@ def normalize_audit_event(event):
             4294967294
         )
     ):
+
         username = uid_to_username(
             uid_int
         )
@@ -1306,15 +1562,41 @@ def normalize_audit_event(event):
             4294967294
         )
     ):
+
         auid_username = uid_to_username(
             auid_int
         )
 
     if not username:
+
         username = process.get(
             "username",
             ""
         )
+
+    # IMPORTANT:
+    # Use auditd values first.
+    # Do not rely on /proc because the process may have
+    # already terminated.
+    audit_ppid = event.get(
+        "ppid",
+        ""
+    )
+
+    audit_process = event.get(
+        "comm",
+        ""
+    )
+
+    audit_exe = event.get(
+        "exe",
+        ""
+    )
+
+    audit_command = event.get(
+        "proctitle",
+        ""
+    )
 
     source_ip = event.get(
         "addr",
@@ -1324,11 +1606,13 @@ def normalize_audit_event(event):
     if source_ip:
 
         try:
+
             ipaddress.ip_address(
                 source_ip
             )
 
         except Exception:
+
             source_ip = ""
 
     success = event.get(
@@ -1336,14 +1620,92 @@ def normalize_audit_event(event):
         ""
     )
 
-    command = process.get(
-        "command",
-        ""
+    # Normalize success to a clear value.
+    if success in (
+        "yes",
+        "1"
+    ):
+
+        success = "yes"
+
+    elif success in (
+        "no",
+        "0"
+    ):
+
+        success = "no"
+
+    # Process name.
+    process_name = (
+        audit_process
+        or process.get(
+            "process",
+            ""
+        )
     )
 
-    if not command:
-        command = event.get(
-            "comm",
+    # Executable.
+    executable = (
+        audit_exe
+        or process.get(
+            "exe",
+            ""
+        )
+    )
+
+    # Command.
+    command = (
+        audit_command
+        or process.get(
+            "command",
+            ""
+        )
+        or audit_process
+    )
+
+    # If proctitle is hex encoded in an audit record,
+    # decode it.
+    if command:
+
+        if re.fullmatch(
+            r"[0-9A-Fa-f]+",
+            command
+        ) and len(command) % 2 == 0:
+
+            try:
+
+                decoded = bytes.fromhex(
+                    command
+                ).replace(
+                    b"\x00",
+                    b" "
+                ).decode(
+                    "utf-8",
+                    errors="replace"
+                ).strip()
+
+                if decoded:
+                    command = decoded
+
+            except Exception:
+                pass
+
+    # Parent process.
+    parent_process = (
+        process.get(
+            "parent_process",
+            ""
+        )
+    )
+
+    if not parent_process and audit_ppid:
+
+        parent_info = process_info(
+            audit_ppid
+        )
+
+        parent_process = parent_info.get(
+            "process",
             ""
         )
 
@@ -1358,53 +1720,39 @@ def normalize_audit_event(event):
             ""
         ),
 
-        "uid": uid,
+        "uid": (
+            uid_int
+            if uid_int != ""
+            else uid
+        ),
 
         "username": username,
 
-        "auid": auid,
+        "auid": (
+            auid_int
+            if auid_int != ""
+            else auid
+        ),
 
         "auid_username": auid_username,
 
-        "pid": process.get(
-            "pid",
-            pid
+        "pid": (
+            int(pid)
+            if str(pid).isdigit()
+            else pid
         ),
 
-        "ppid": process.get(
-            "ppid",
-            event.get(
-                "ppid",
-                ""
-            )
+        "ppid": (
+            int(audit_ppid)
+            if str(audit_ppid).isdigit()
+            else audit_ppid
         ),
 
-        "process": (
-            process.get(
-                "process",
-                ""
-            )
-            or event.get(
-                "comm",
-                ""
-            )
-        ),
+        "process": process_name,
 
-        "parent_process": process.get(
-            "parent_process",
-            ""
-        ),
+        "parent_process": parent_process,
 
-        "exe": (
-            process.get(
-                "exe",
-                ""
-            )
-            or event.get(
-                "exe",
-                ""
-            )
-        ),
+        "exe": executable,
 
         "command": command,
 
@@ -1449,6 +1797,7 @@ def find_audit_context(
         )
 
     else:
+
         events = before_events
 
     if not events:
@@ -1459,6 +1808,8 @@ def find_audit_context(
     )
 
     candidates = []
+
+    current_time = time.time()
 
     for event in events:
 
@@ -1472,6 +1823,7 @@ def find_audit_context(
         for name in names:
 
             try:
+
                 if os.path.realpath(
                     name
                 ) == target_path:
@@ -1489,6 +1841,36 @@ def find_audit_context(
         normalized = normalize_audit_event(
             event
         )
+
+        # Ignore events that are clearly too old.
+        timestamp_text = normalized.get(
+            "timestamp",
+            ""
+        )
+
+        if timestamp_text:
+
+            try:
+
+                event_dt = datetime.fromisoformat(
+                    timestamp_text
+                )
+
+                event_timestamp = (
+                    event_dt.timestamp()
+                )
+
+                # We only need a recent audit event.
+                # 120 seconds is enough for the polling monitor.
+                if (
+                    current_time
+                    - event_timestamp
+                    > 120
+                ):
+                    continue
+
+            except Exception:
+                pass
 
         candidates.append(
             normalized
@@ -1609,6 +1991,7 @@ def geoip(ip):
         return {}
 
     try:
+
         address = ipaddress.ip_address(
             ip
         )
@@ -1620,6 +2003,7 @@ def geoip(ip):
             or address.is_reserved
             or address.is_multicast
         ):
+
             return {}
 
     except Exception:
@@ -1647,6 +2031,7 @@ def geoip(ip):
         return {}
 
     try:
+
         data = json.loads(
             stdout
         )
@@ -1696,6 +2081,7 @@ def map_keys(keys):
         )
 
         if identity:
+
             result[identity] = key
 
     return result
@@ -1720,6 +2106,7 @@ def compare_keys(
     for identity, key in new_map.items():
 
         if identity not in old_map:
+
             added.append(
                 key
             )
@@ -1727,6 +2114,7 @@ def compare_keys(
     for identity, key in old_map.items():
 
         if identity not in new_map:
+
             removed.append(
                 key
             )
@@ -1752,23 +2140,35 @@ def create_event(
     if audit_context is None:
         audit_context = {}
 
+    audit_source_ip = audit_context.get(
+        "source_ip",
+        ""
+    )
+
+    session_source_ip = ""
+
+    if not audit_source_ip:
+
+        session_source_ip = find_ssh_source_ip()
+
     source_ip = (
-        audit_context.get(
-            "source_ip"
-        )
-        or find_ssh_source_ip()
+        audit_source_ip
+        or session_source_ip
         or ""
     )
 
-    if audit_context.get("source_ip"):
+    if audit_source_ip:
+
         source_ip_source = "auditd"
 
-    elif source_ip:
+    elif session_source_ip:
+
         source_ip_source = (
             "active_ssh_session"
         )
 
     else:
+
         source_ip_source = "unknown"
 
     location = geoip(
@@ -1806,7 +2206,9 @@ def create_event(
     )
 
     event_hash = hashlib.sha256(
-        event_seed.encode("utf-8")
+        event_seed.encode(
+            "utf-8"
+        )
     ).hexdigest()[:16]
 
     event_id = (
@@ -1825,6 +2227,11 @@ def create_event(
         "timestamp": local_now(),
 
         "timestamp_utc": utc_now(),
+
+        "audit_timestamp": audit_context.get(
+            "timestamp",
+            ""
+        ),
 
         "action": action,
 
@@ -2090,6 +2497,13 @@ def initialize():
         state
     )
 
+    # Make sure auditd is configured immediately.
+    if os.geteuid() == 0:
+
+        if auditd_available():
+
+            ensure_audit_rules()
+
     print(
         "SSH key baseline created."
     )
@@ -2144,6 +2558,9 @@ def scan_once(
     new_files = build_snapshot()
 
     events = []
+
+    # Read audit data once before comparing files.
+    audit_events = audit_recent_events()
 
     for path, new_info in new_files.items():
 
@@ -2219,8 +2636,11 @@ def scan_once(
             )
         }
 
+        # Search the audit event that belongs to this
+        # exact authorized_keys path.
         audit_context = find_audit_context(
-            path
+            path,
+            audit_events
         )
 
         for key in added:
@@ -2375,10 +2795,16 @@ def monitor(
             ):
 
                 try:
+
                     ensure_audit_rules()
 
-                except Exception:
-                    pass
+                except Exception as exc:
+
+                    print(
+                        "Audit rule refresh error: {}".format(
+                            exc
+                        )
+                    )
 
                 last_rules_refresh = now
 
@@ -2443,11 +2869,13 @@ def show_events(
         return
 
     try:
+
         limit = int(
             limit
         )
 
     except Exception:
+
         limit = 20
 
     if limit < 1:
@@ -2490,6 +2918,15 @@ def show_events(
             "Time: {}".format(
                 event.get(
                     "timestamp",
+                    ""
+                )
+            )
+        )
+
+        print(
+            "Audit time: {}".format(
+                event.get(
+                    "audit_timestamp",
                     ""
                 )
             )
@@ -3009,6 +3446,18 @@ def show_audit_status():
             "auditctl: unavailable"
         )
 
+    if ausearch_available():
+
+        print(
+            "ausearch: available"
+        )
+
+    else:
+
+        print(
+            "ausearch: unavailable"
+        )
+
     rule_path = Path(
         AUDIT_RULE_FILE
     )
@@ -3042,12 +3491,158 @@ def show_audit_status():
             "Rules file: not found"
         )
 
+    print(
+        "----------------------------------------"
+    )
+
+    print(
+        "Loaded audit rules:"
+    )
+
+    code, stdout, stderr = run_command(
+        [
+            "auditctl",
+            "-l"
+        ],
+        timeout=10
+    )
+
+    if code == 0:
+
+        found = False
+
+        for line in stdout.splitlines():
+
+            if AUDIT_KEY in line:
+
+                print(
+                    line
+                )
+
+                found = True
+
+        if not found:
+
+            print(
+                "No ServerGuard audit rules loaded."
+            )
+
+    else:
+
+        print(
+            "Unable to read audit rules."
+        )
+
+    print(
+        "----------------------------------------"
+    )
+
+    print(
+        "Recent ServerGuard audit events:"
+    )
+
+    events = audit_recent_events()
+
+    if not events:
+
+        print(
+            "No recent audit events."
+        )
+
+    else:
+
+        for event in events[:10]:
+
+            print()
+
+            print(
+                "Serial: {}".format(
+                    event.get(
+                        "serial",
+                        ""
+                    )
+                )
+            )
+
+            print(
+                "Time: {}".format(
+                    event.get(
+                        "timestamp",
+                        ""
+                    )
+                )
+            )
+
+            print(
+                "Path: {}".format(
+                    event.get(
+                        "name",
+                        ""
+                    )
+                )
+            )
+
+            print(
+                "PID: {}".format(
+                    event.get(
+                        "pid",
+                        ""
+                    )
+                )
+            )
+
+            print(
+                "UID: {}".format(
+                    event.get(
+                        "uid",
+                        ""
+                    )
+                )
+            )
+
+            print(
+                "AUID: {}".format(
+                    event.get(
+                        "auid",
+                        ""
+                    )
+                )
+            )
+
+            print(
+                "Process: {}".format(
+                    event.get(
+                        "comm",
+                        ""
+                    )
+                )
+            )
+
+            print(
+                "EXE: {}".format(
+                    event.get(
+                        "exe",
+                        ""
+                    )
+                )
+            )
+
+            print(
+                "Success: {}".format(
+                    event.get(
+                        "success",
+                        ""
+                    )
+                )
+            )
+
 
 # ============================================================
 # REMOVE AUDIT RULES
 # ============================================================
 
 def remove_audit_rules():
+
     if os.geteuid() != 0:
 
         print(
@@ -3058,45 +3653,7 @@ def remove_audit_rules():
 
     if auditd_available():
 
-        code, stdout, stderr = run_command(
-            [
-                "auditctl",
-                "-l"
-            ],
-            timeout=10
-        )
-
-        if code == 0:
-
-            rules = stdout.splitlines()
-
-            for rule in rules:
-
-                if AUDIT_KEY not in rule:
-                    continue
-
-                match = re.search(
-                    r"^-w\s+(\S+)",
-                    rule
-                )
-
-                if not match:
-                    continue
-
-                watched_path = match.group(1)
-
-                run_command(
-                    [
-                        "auditctl",
-                        "-W",
-                        watched_path,
-                        "-p",
-                        "wa",
-                        "-k",
-                        AUDIT_KEY
-                    ],
-                    timeout=10
-                )
+        remove_live_audit_rules()
 
     rule_path = Path(
         AUDIT_RULE_FILE
@@ -3105,6 +3662,7 @@ def remove_audit_rules():
     if rule_path.exists():
 
         try:
+
             rule_path.unlink()
 
         except Exception:
