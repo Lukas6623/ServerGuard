@@ -4,7 +4,7 @@
     "sha256": "D0AF129C0AB908A17E2A775F58973EFB1962F277EDEEBD6A534F21FE5F67668B",
 
     "installer_version": "0.0.1",
-    "installer_url": "https://github.com/Lukas6623/ServerGuardCode/releases/download/V.0.0.1/ServerGuardSetupV1.zip"
+    "installer_url": "https://github.com/Lukas6623/ServerGuardCode/releases/download/V.0.0.1/ServerGuardSetupV1.zip",
 
     "web_url": "https://github.com/Lukas6623/serverguard-web/releases/download/v1.0.0/web.zip",
     "web_sha256": "69906FCECE77645F4F5BEA47C3EE5738A1E37C730FFC7B5E7F0D353D5C5E2F99"
