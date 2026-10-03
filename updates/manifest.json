@@ -3,8 +3,8 @@
     "url": "https://github.com/Lukas6623/ServerGuard/releases/download/v1.0.8/ServerGuard-v1.0.8.zip",
     "sha256": "451468095FC75AD684E4478480C767DD2B34D98820B94BF9316C24839BEFD4C6",
 
-    "installer_version": "1.0.0",
-    "installer_url": "https://github.com/Lukas6623/ServerGuardCode/releases/download/V.0.0.1/ServerGuardSetupV1.zip",
+    "installer_version": "0.0.2",
+    "installer_url": "https://github.com/Lukas6623/ServerGuardCode/releases/download/V.0.0.2/ServerGuardSetup.zip",
 
     "web_url": "https://github.com/Lukas6623/serverguard-web/releases/download/v1.0.1/web.zip",
     "web_sha256": "BC0AB4342F2AAD127BA70F1DA332B4E6ED4C86BF684643BC14AF158A72BC14E1"
