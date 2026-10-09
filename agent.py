@@ -1,19 +1,18 @@
+
 #!/usr/bin/env python3
 
 import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import socket
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-
-# ============================================================
-# SERVERGUARD SERVER INFORMATION
-# ============================================================
 
 AGENT_NAME = "ServerGuard Agent"
 AGENT_VERSION = "0.2.0"
@@ -23,29 +22,18 @@ DATA_DIR = BASE_DIR / "data"
 SERVER_INFO_FILE = DATA_DIR / "server_info.json"
 
 
-# ============================================================
-# COMMAND EXECUTION
-# ============================================================
-
-def run_command(command):
-    """
-    Execute shell command and return stdout.
-    Never raises an exception.
-    """
-
+def run_command(command, timeout=10):
     try:
         result = subprocess.run(
             command,
-            shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=10
+            timeout=timeout,
+            check=False
         )
-
         return result.stdout.strip()
-
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return ""
 
 
@@ -53,78 +41,71 @@ def command_exists(command):
     return shutil.which(command) is not None
 
 
-# ============================================================
-# FILE READING
-# ============================================================
-
 def read_file(path):
     try:
         return Path(path).read_text(
             encoding="utf-8",
-            errors="ignore"
+            errors="replace"
         )
-    except Exception:
+    except (OSError, UnicodeError):
         return ""
 
 
-# ============================================================
-# OS INFORMATION
-# ============================================================
+def parse_integer(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
 
 def get_os_info():
+    system = platform.system()
+
     info = {
-        "name": platform.system(),
+        "name": system,
         "distribution": "",
         "version": "",
         "version_id": "",
         "kernel": platform.release(),
         "architecture": platform.machine(),
         "hostname": socket.gethostname(),
-        "fqdn": ""
+        "fqdn": socket.getfqdn()
     }
 
-    if platform.system() == "Linux":
+    if system == "Linux":
+        values = {}
 
-        os_release = read_file("/etc/os-release")
-
-        for line in os_release.splitlines():
+        for line in read_file("/etc/os-release").splitlines():
             if "=" not in line:
                 continue
 
             key, value = line.split("=", 1)
 
-            value = value.strip().strip('"')
+            try:
+                parsed = shlex.split(value)
+                values[key] = parsed[0] if parsed else ""
+            except ValueError:
+                values[key] = value.strip('"')
 
-            if key == "NAME":
-                info["distribution"] = value
+        info["distribution"] = values.get("NAME", "")
+        info["version"] = values.get(
+            "PRETTY_NAME",
+            values.get("VERSION", "")
+        )
+        info["version_id"] = values.get("VERSION_ID", "")
 
-            elif key == "PRETTY_NAME":
-                info["version"] = value
-
-            elif key == "VERSION_ID":
-                info["version_id"] = value
-
-        fqdn = run_command("hostname -f")
-
+        fqdn = run_command(["hostname", "-f"])
         if fqdn and fqdn != "localhost":
             info["fqdn"] = fqdn
-        else:
-            info["fqdn"] = socket.getfqdn()
 
     else:
         info["version"] = platform.version()
-        info["fqdn"] = socket.getfqdn()
 
     return info
 
 
-# ============================================================
-# SERVER INFORMATION
-# ============================================================
-
 def get_server_info():
     hostname = socket.gethostname()
-
     fqdn = socket.getfqdn()
 
     if not fqdn or fqdn == "localhost":
@@ -136,13 +117,9 @@ def get_server_info():
     }
 
 
-# ============================================================
-# CPU INFORMATION
-# ============================================================
-
 def get_cpu_info():
-
     cpu_model = ""
+    physical_cores = None
 
     if platform.system() == "Linux":
         cpuinfo = read_file("/proc/cpuinfo")
@@ -153,208 +130,139 @@ def get_cpu_info():
                     cpu_model = line.split(":", 1)[1].strip()
                     break
 
+        if command_exists("lscpu"):
+            output = run_command([
+                "lscpu",
+                "-p=CORE,SOCKET"
+            ])
+
+            core_pairs = set()
+
+            for line in output.splitlines():
+                if not line or line.startswith("#"):
+                    continue
+
+                parts = line.split(",")
+
+                if len(parts) != 2:
+                    continue
+
+                if parts[0].isdigit() and parts[1].isdigit():
+                    core_pairs.add((parts[0], parts[1]))
+
+            if core_pairs:
+                physical_cores = len(core_pairs)
+
     if not cpu_model:
         cpu_model = platform.processor()
 
-    logical_processors = os.cpu_count() or 0
-
-    physical_cores = None
-
-    if platform.system() == "Linux":
-
-        output = run_command(
-            "lscpu 2>/dev/null | grep '^Core(s) per socket:'"
-        )
-
-        if output:
-            match = re.search(r":\s*(\d+)", output)
-
-            if match:
-                cores_per_socket = int(match.group(1))
-
-                sockets_output = run_command(
-                    "lscpu 2>/dev/null | grep '^Socket(s):'"
-                )
-
-                socket_match = re.search(
-                    r":\s*(\d+)",
-                    sockets_output
-                )
-
-                if socket_match:
-                    sockets = int(socket_match.group(1))
-                    physical_cores = cores_per_socket * sockets
-
     return {
         "model": cpu_model,
-        "logical_processors": logical_processors,
+        "logical_processors": os.cpu_count() or 0,
         "physical_cores": physical_cores
     }
 
 
-# ============================================================
-# MEMORY INFORMATION
-# ============================================================
-
 def get_memory_info():
-
-    if platform.system() == "Linux":
-
-        meminfo = read_file("/proc/meminfo")
-
-        values = {}
-
-        for line in meminfo.splitlines():
-
-            parts = line.split()
-
-            if len(parts) >= 2:
-
-                key = parts[0].rstrip(":")
-
-                try:
-                    value_kb = int(parts[1])
-                    values[key] = value_kb
-                except ValueError:
-                    pass
-
-        total_kb = values.get("MemTotal", 0)
-        available_kb = values.get("MemAvailable", 0)
-
-        used_kb = max(total_kb - available_kb, 0)
-
+    if platform.system() != "Linux":
         return {
-            "total_mb": round(total_kb / 1024),
-            "used_mb": round(used_kb / 1024),
-            "available_mb": round(available_kb / 1024),
-            "swap_total_mb": round(
-                values.get("SwapTotal", 0) / 1024
-            ),
-            "swap_free_mb": round(
-                values.get("SwapFree", 0) / 1024
-            )
+            "total_mb": None,
+            "used_mb": None,
+            "available_mb": None,
+            "swap_total_mb": None,
+            "swap_free_mb": None
         }
 
+    values = {}
+
+    for line in read_file("/proc/meminfo").splitlines():
+        parts = line.split()
+
+        if len(parts) < 2:
+            continue
+
+        value = parse_integer(parts[1])
+
+        if value is not None:
+            values[parts[0].rstrip(":")] = value
+
+    total = values.get("MemTotal", 0)
+    available = values.get("MemAvailable", 0)
+
     return {
-        "total_mb": None,
-        "used_mb": None,
-        "available_mb": None,
-        "swap_total_mb": None,
-        "swap_free_mb": None
+        "total_mb": round(total / 1024),
+        "used_mb": round(max(total - available, 0) / 1024),
+        "available_mb": round(available / 1024),
+        "swap_total_mb": round(values.get("SwapTotal", 0) / 1024),
+        "swap_free_mb": round(values.get("SwapFree", 0) / 1024)
     }
 
 
-# ============================================================
-# DISK INFORMATION
-# ============================================================
-
 def get_disk_info():
+    if not command_exists("df"):
+        return []
+
+    output = run_command([
+        "df", "-P", "-k",
+        "-x", "tmpfs",
+        "-x", "devtmpfs"
+    ])
 
     disks = []
 
-    output = run_command(
-        "df -P -k -x tmpfs -x devtmpfs 2>/dev/null"
-    )
-
-    if not output:
-        return disks
-
-    lines = output.splitlines()
-
-    for line in lines[1:]:
-
+    for line in output.splitlines()[1:]:
         parts = line.split()
 
         if len(parts) < 6:
             continue
 
-        filesystem = parts[0]
-        total_kb = parts[1]
-        used_kb = parts[2]
-        free_kb = parts[3]
-        usage = parts[4]
-        mount = parts[5]
-
-        if not total_kb.isdigit():
-            continue
-
         try:
-
-            total_gb = int(total_kb) / 1024 / 1024
-            used_gb = int(used_kb) / 1024 / 1024
-            free_gb = int(free_kb) / 1024 / 1024
-
-            usage_percent = float(
-                usage.rstrip("%")
-            )
-
-            disks.append({
-                "filesystem": filesystem,
-                "mount": mount,
-                "total_gb": round(total_gb, 2),
-                "used_gb": round(used_gb, 2),
-                "free_gb": round(free_gb, 2),
-                "usage_percent": usage_percent
-            })
-
-        except Exception:
+            total_kb = int(parts[1])
+            used_kb = int(parts[2])
+            free_kb = int(parts[3])
+            usage = float(parts[4].rstrip("%"))
+        except ValueError:
             continue
+
+        disks.append({
+            "filesystem": parts[0],
+            "mount": parts[5],
+            "total_gb": round(total_kb / 1024 / 1024, 2),
+            "used_gb": round(used_kb / 1024 / 1024, 2),
+            "free_gb": round(free_kb / 1024 / 1024, 2),
+            "usage_percent": usage
+        })
 
     return disks
 
 
-# ============================================================
-# NETWORK INTERFACES
-# ============================================================
-
 def get_network_interfaces():
+    if not command_exists("ip"):
+        return []
 
+    output = run_command(["ip", "-o", "addr", "show"])
     interfaces = []
 
-    output = run_command(
-        "ip -o addr show 2>/dev/null"
-    )
-
-    if not output:
-        return interfaces
-
     for line in output.splitlines():
-
         parts = line.split()
 
-        if len(parts) < 4:
+        if len(parts) < 4 or parts[2] not in ("inet", "inet6"):
             continue
-
-        interface = parts[1]
-
-        if parts[2] not in ("inet", "inet6"):
-            continue
-
-        address = parts[3]
 
         interfaces.append({
-            "interface": interface,
+            "interface": parts[1],
             "family": parts[2],
-            "address": address
+            "address": parts[3]
         })
 
     return interfaces
 
 
-# ============================================================
-# SERVER ADDRESSES
-# ============================================================
-
 def get_host_addresses(network_interfaces):
-
     addresses = []
 
     for item in network_interfaces:
-
-        address = item.get("address", "")
-
-        if "/" in address:
-            address = address.split("/", 1)[0]
+        address = item.get("address", "").split("/", 1)[0]
 
         if address and address not in addresses:
             addresses.append(address)
@@ -362,81 +270,63 @@ def get_host_addresses(network_interfaces):
     return addresses
 
 
-# ============================================================
-# LISTENING PORTS
-# ============================================================
-
-def get_listening_ports():
-
-    ports = []
-
-    output = run_command(
-        "ss -lntup 2>/dev/null"
+def parse_socket_process(line):
+    match = re.search(
+        r'users:\(\("([^"]+)",pid=(\d+)',
+        line
     )
 
-    if not output:
-        return ports
+    if not match:
+        return None, None
+
+    return match.group(1), match.group(2)
+
+
+def parse_address_port(value):
+    if value.startswith("["):
+        match = re.match(r"\[(.*?)\]:(\d+)$", value)
+
+        if match:
+            return match.group(1), int(match.group(2))
+
+        return value, None
+
+    if ":" not in value:
+        return value, None
+
+    address, port = value.rsplit(":", 1)
+
+    if port.isdigit():
+        return address, int(port)
+
+    return value, None
+
+
+def get_listening_ports():
+    if not command_exists("ss"):
+        return []
+
+    output = run_command(["ss", "-lntup"])
+    ports = []
 
     for line in output.splitlines():
-
-        if not line.startswith("tcp"):
-            continue
-
         parts = line.split()
 
-        if len(parts) < 5:
+        if len(parts) < 5 or parts[0] not in ("tcp", "tcp6", "udp", "udp6"):
             continue
 
         protocol = parts[0]
+        local_address, port = parse_address_port(parts[4])
 
-        local_address = parts[4]
-
-        process_info = ""
-
-        if "users:" in line:
-            process_info = line[line.find("users:"):]
-
-        address = local_address
-        port = ""
-
-        # IPv6: [::]:22
-        if local_address.startswith("["):
-
-            match = re.match(
-                r"\[(.*?)\]:(\d+)$",
-                local_address
-            )
-
-            if match:
-                address = match.group(1)
-                port = match.group(2)
-
-        else:
-
-            if ":" in local_address:
-
-                address, port = local_address.rsplit(":", 1)
-
-        if not port.isdigit():
+        if port is None:
             continue
 
-        process_name = None
-        pid = None
-
-        match = re.search(
-            r'users:\(\("([^"]+)",pid=(\d+)',
-            process_info
-        )
-
-        if match:
-
-            process_name = match.group(1)
-            pid = match.group(2)
+        process_name, pid = parse_socket_process(line)
 
         ports.append({
             "protocol": protocol,
-            "address": address,
-            "port": int(port),
+            "address": local_address,
+            "port": port,
             "process": process_name,
             "pid": pid
         })
@@ -444,50 +334,25 @@ def get_listening_ports():
     return ports
 
 
-# ============================================================
-# ACTIVE CONNECTIONS
-# ============================================================
-
 def get_active_connections():
+    if not command_exists("ss"):
+        return []
 
+    output = run_command(["ss", "-tnp"])
     connections = []
 
-    output = run_command(
-        "ss -tnp 2>/dev/null"
-    )
-
-    if not output:
-        return connections
-
     for line in output.splitlines():
-
-        if not line.startswith("ESTAB"):
-            continue
-
         parts = line.split()
 
-        if len(parts) < 5:
+        if len(parts) < 5 or parts[0] != "ESTAB":
             continue
 
-        local_address = parts[3]
-        remote_address = parts[4]
-
-        process_name = None
-        pid = None
-
-        match = re.search(
-            r'users:\(\("([^"]+)",pid=(\d+)',
-            line
-        )
-
-        if match:
-            process_name = match.group(1)
-            pid = match.group(2)
+        process_name, pid = parse_socket_process(line)
 
         connections.append({
             "state": "ESTABLISHED",
-            "local": local_address,
-            "remote": remote_address,
+            "local": parts[3],
+            "remote": parts[4],
             "process": process_name,
             "pid": pid
         })
@@ -495,92 +360,71 @@ def get_active_connections():
     return connections
 
 
-# ============================================================
-# PROCESSES
-# ============================================================
-
 def get_processes():
+    if not command_exists("ps"):
+        return []
+
+    output = run_command([
+        "ps", "-eo",
+        "pid=,ppid=,user=,stat=,comm=,args=",
+        "--sort=pid"
+    ])
 
     processes = []
 
-    output = run_command(
-        "ps -eo pid=,ppid=,user=,stat=,comm=,args= --sort=pid"
-    )
-
-    if not output:
-        return processes
-
     for line in output.splitlines():
-
         parts = line.split(None, 5)
 
         if len(parts) < 5:
             continue
 
-        pid = parts[0]
-        ppid = parts[1]
-        user = parts[2]
-        status = parts[3]
-        name = parts[4]
-
-        command = parts[5] if len(parts) >= 6 else ""
-
         processes.append({
-            "pid": pid,
-            "ppid": ppid,
-            "name": name,
-            "user": user,
-            "status": status,
-            "command": command
+            "pid": parts[0],
+            "ppid": parts[1],
+            "user": parts[2],
+            "status": parts[3],
+            "name": parts[4],
+            "command": parts[5] if len(parts) > 5 else ""
         })
 
     return processes
 
 
-# ============================================================
-# USERS
-# ============================================================
-
 def get_users():
-
     users = []
+    valid_shells = {
+        line.strip()
+        for line in read_file("/etc/shells").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
 
-    passwd = read_file("/etc/passwd")
-
-    for line in passwd.splitlines():
-
+    for line in read_file("/etc/passwd").splitlines():
         parts = line.split(":")
 
         if len(parts) < 7:
             continue
 
-        username = parts[0]
-        uid = parts[2]
-        home = parts[5]
-        shell = parts[6]
+        username, uid, home, shell = (
+            parts[0], parts[2], parts[5], parts[6]
+        )
 
-        try:
-            uid_number = int(uid)
-        except ValueError:
+        uid_number = parse_integer(uid)
+
+        if uid_number is None:
             continue
 
-        login_shells = [
-            "/bin/bash",
-            "/bin/sh",
-            "/bin/zsh",
-            "/bin/fish",
-            "/usr/bin/bash",
-            "/usr/bin/zsh"
-        ]
-
-        login_capable = shell in login_shells
-
-        if uid_number >= 1000:
-            user_type = "human"
-        elif uid_number == 0:
+        if uid_number == 0:
             user_type = "root"
+        elif uid_number >= 1000:
+            user_type = "human"
         else:
             user_type = "system"
+
+        login_capable = (
+            shell in valid_shells
+            and not shell.endswith("/nologin")
+            and not shell.endswith("/false")
+        )
 
         users.append({
             "username": username,
@@ -594,98 +438,64 @@ def get_users():
     return users
 
 
-# ============================================================
-# SUDO USERS
-# ============================================================
-
 def get_sudo_users():
-
-    sudo_users = []
-
     if not command_exists("getent"):
-        return sudo_users
+        return []
 
-    output = run_command(
-        "getent group sudo 2>/dev/null"
-    )
+    output = run_command(["getent", "group", "sudo"])
 
-    if output and ":" in output:
+    if not output:
+        return []
 
-        parts = output.split(":")
+    parts = output.split(":")
 
-        if len(parts) >= 4:
+    if len(parts) < 4 or not parts[3].strip():
+        return []
 
-            members = parts[3].strip()
+    return [
+        username.strip()
+        for username in parts[3].split(",")
+        if username.strip()
+    ]
 
-            if members:
-
-                for username in members.split(","):
-
-                    username = username.strip()
-
-                    if username:
-                        sudo_users.append(username)
-
-    return sudo_users
-
-
-# ============================================================
-# SSH INFORMATION
-# ============================================================
 
 def get_ssh_info():
-
     installed = command_exists("sshd")
-
-    if not installed:
-
-        ssh_path = shutil.which("ssh")
-
-        installed = ssh_path is not None
-
     service_active = False
-
-    if command_exists("systemctl"):
-
-        status = run_command(
-            "systemctl is-active ssh 2>/dev/null"
-        )
-
-        if status == "active":
-            service_active = True
-        else:
-
-            status = run_command(
-                "systemctl is-active sshd 2>/dev/null"
-            )
-
-            service_active = status == "active"
-
     port = 22
 
-    ssh_config = read_file(
-        "/etc/ssh/sshd_config"
-    )
+    if command_exists("systemctl"):
+        for service in ("ssh", "sshd"):
+            status = run_command([
+                "systemctl", "is-active", service
+            ])
 
-    for line in ssh_config.splitlines():
+            if status == "active":
+                service_active = True
+                break
 
-        line = line.strip()
+    if installed:
+        effective_config = run_command(["sshd", "-T"])
 
-        if not line:
-            continue
+        for line in effective_config.splitlines():
+            match = re.match(r"port\s+(\d+)", line, re.IGNORECASE)
 
-        if line.startswith("#"):
-            continue
+            if match:
+                port = int(match.group(1))
+                break
 
-        match = re.match(
-            r"Port\s+(\d+)",
-            line,
-            re.IGNORECASE
-        )
+    if port == 22:
+        for line in read_file("/etc/ssh/sshd_config").splitlines():
+            line = line.strip()
 
-        if match:
-            port = int(match.group(1))
-            break
+            if not line or line.startswith("#"):
+                continue
+
+            match = re.match(r"Port\s+(\d+)", line, re.IGNORECASE)
+
+            if match:
+                port = int(match.group(1))
+                break
 
     return {
         "installed": installed,
@@ -694,239 +504,154 @@ def get_ssh_info():
     }
 
 
-# ============================================================
-# FIREWALL
-# ============================================================
-
 def get_firewall_info():
-
     result = {
         "detected": False,
         "type": None,
         "active": False
     }
 
-    # UFW
     if command_exists("ufw"):
-
         result["detected"] = True
         result["type"] = "ufw"
-
-        status = run_command(
-            "ufw status 2>/dev/null"
+        result["active"] = run_command(["ufw", "status"]).startswith(
+            "Status: active"
         )
-
-        if status.startswith("Status: active"):
-            result["active"] = True
-
         return result
 
-    # firewalld
     if command_exists("firewall-cmd"):
-
         result["detected"] = True
         result["type"] = "firewalld"
-
-        status = run_command(
-            "firewall-cmd --state 2>/dev/null"
-        )
-
-        result["active"] = status == "running"
-
+        result["active"] = run_command(
+            ["firewall-cmd", "--state"]
+        ) == "running"
         return result
 
-    # nftables
     if command_exists("nft"):
-
         result["detected"] = True
         result["type"] = "nftables"
-
-        rules = run_command(
-            "nft list ruleset 2>/dev/null"
+        result["active"] = bool(
+            run_command(["nft", "list", "ruleset"])
         )
+        return result
 
-        result["active"] = bool(rules)
-
+    if command_exists("iptables"):
+        result["detected"] = True
+        result["type"] = "iptables"
+        result["active"] = bool(
+            run_command(["iptables", "-S"])
+        )
         return result
 
     return result
 
 
-# ============================================================
-# SYSTEMD SERVICES
-# ============================================================
-
 def get_services():
+    if not command_exists("systemctl"):
+        return []
+
+    output = run_command([
+        "systemctl", "list-units",
+        "--type=service",
+        "--all",
+        "--no-legend",
+        "--no-pager"
+    ])
 
     services = []
 
-    if not command_exists("systemctl"):
-        return services
-
-    output = run_command(
-        "systemctl list-units --type=service "
-        "--all --no-legend --no-pager 2>/dev/null"
-    )
-
-    if not output:
-        return services
-
     for line in output.splitlines():
-
         parts = line.split(None, 4)
 
         if len(parts) < 4:
             continue
 
-        service_name = parts[0]
-        load_state = parts[1]
-        active_state = parts[2]
-        sub_state = parts[3]
-
-        description = parts[4] if len(parts) >= 5 else ""
-
         services.append({
-            "name": service_name,
-            "load": load_state,
-            "active": active_state,
-            "sub": sub_state,
-            "description": description
+            "name": parts[0],
+            "load": parts[1],
+            "active": parts[2],
+            "sub": parts[3],
+            "description": parts[4] if len(parts) > 4 else ""
         })
 
     return services
 
 
-# ============================================================
-# CRON
-# ============================================================
-
 def get_cron_info():
+    installed = (
+        command_exists("cron")
+        or command_exists("crond")
+        or command_exists("crontab")
+    )
 
-    result = {
-        "installed": command_exists("cron"),
-        "service_active": False,
-        "system_crontab": False,
+    service_active = False
+
+    if command_exists("systemctl"):
+        for service in ("cron", "crond"):
+            if run_command(["systemctl", "is-active", service]) == "active":
+                service_active = True
+                break
+
+    return {
+        "installed": installed,
+        "service_active": service_active,
+        "system_crontab": bool(read_file("/etc/crontab").strip()),
         "user_crontabs": []
     }
 
-    if command_exists("systemctl"):
-
-        status = run_command(
-            "systemctl is-active cron 2>/dev/null"
-        )
-
-        result["service_active"] = status == "active"
-
-    system_crontab = read_file("/etc/crontab")
-
-    result["system_crontab"] = bool(
-        system_crontab.strip()
-    )
-
-    return result
-
-
-# ============================================================
-# SOFTWARE
-# ============================================================
 
 def get_software_info():
+    programs = {
+        "python3": "python3",
+        "python": "python",
+        "gcc": "gcc",
+        "g++": "g++",
+        "git": "git",
+        "curl": "curl",
+        "wget": "wget",
+        "docker": "docker",
+        "postgres": "postgresql",
+        "mysql": "mysql",
+        "nginx": "nginx",
+        "apache2": "apache",
+        "redis-server": "redis",
+        "node": "node",
+        "npm": "npm"
+    }
 
     software = {}
 
-    programs = [
-        "python3",
-        "python",
-        "gcc",
-        "g++",
-        "git",
-        "curl",
-        "wget",
-        "docker",
-        "postgres",
-        "psql",
-        "mysql",
-        "mysqld",
-        "nginx",
-        "apache2",
-        "redis-server",
-        "node",
-        "npm"
-    ]
+    for executable, key in programs.items():
+        path = shutil.which(executable)
 
-    for program in programs:
-
-        path = shutil.which(program)
-
-        key = program
-
-        if program == "python3":
-            key = "python3"
-
-        elif program == "postgres":
-            key = "postgresql"
-
-        elif program == "psql":
-            continue
-
-        elif program == "mysqld":
-            continue
-
-        elif program == "apache2":
-            key = "apache"
-
-        elif program == "redis-server":
-            key = "redis"
-
-        if path:
-
-            version = ""
-
-            version_output = run_command(
-                f"{program} --version 2>/dev/null"
-            )
-
-            if version_output:
-                version = version_output.splitlines()[0]
-
-            software[key] = {
-                "installed": True,
-                "path": path,
-                "version": version
-            }
-
-        elif key not in software:
-
+        if not path:
             software[key] = {
                 "installed": False,
                 "path": None,
                 "version": None
             }
+            continue
+
+        version_output = run_command([path, "--version"])
+        version = version_output.splitlines()[0] if version_output else ""
+
+        software[key] = {
+            "installed": True,
+            "path": path,
+            "version": version
+        }
 
     return software
 
 
-# ============================================================
-# UPTIME
-# ============================================================
-
 def get_uptime():
-
     uptime_seconds = 0
-
-    uptime_file = read_file(
-        "/proc/uptime"
-    )
+    uptime_file = read_file("/proc/uptime")
 
     if uptime_file:
-
         try:
-            uptime_seconds = int(
-                float(
-                    uptime_file.split()[0]
-                )
-            )
-        except Exception:
+            uptime_seconds = int(float(uptime_file.split()[0]))
+        except (ValueError, IndexError):
             pass
 
     return {
@@ -937,260 +662,179 @@ def get_uptime():
     }
 
 
-# ============================================================
-# KERNEL SECURITY
-# ============================================================
-
 def get_kernel_security():
-
     result = {
         "secure_boot": None,
         "aslr": None
     }
 
-    # ASLR
     aslr = read_file(
         "/proc/sys/kernel/randomize_va_space"
     ).strip()
 
     if aslr:
+        value = parse_integer(aslr)
 
-        try:
-            value = int(aslr)
-
+        if value is not None:
             result["aslr"] = {
                 "value": value,
                 "enabled": value > 0
             }
 
-        except ValueError:
-            pass
-
-    # Secure Boot
     if command_exists("mokutil"):
-
-        output = run_command(
-            "mokutil --sb-state 2>/dev/null"
-        )
+        output = run_command(["mokutil", "--sb-state"])
 
         if "SecureBoot enabled" in output:
             result["secure_boot"] = True
-
         elif "SecureBoot disabled" in output:
             result["secure_boot"] = False
 
     return result
 
 
-# ============================================================
-# PACKAGE INFORMATION
-# ============================================================
-
 def get_package_info():
-
     result = {
         "manager": None,
         "package_count": None
     }
 
-    if command_exists("dpkg"):
-
+    if command_exists("dpkg-query"):
         result["manager"] = "apt/dpkg"
-
-        output = run_command(
-            "dpkg-query -f '${binary:Package}\\n' -W 2>/dev/null"
-        )
-
-        if output:
-            result["package_count"] = len(
-                output.splitlines()
-            )
+        output = run_command([
+            "dpkg-query",
+            "-f=${binary:Package}\\n",
+            "-W"
+        ])
 
     elif command_exists("rpm"):
-
         result["manager"] = "rpm"
+        output = run_command(["rpm", "-qa"])
 
-        output = run_command(
-            "rpm -qa 2>/dev/null"
-        )
+    else:
+        return result
 
-        if output:
-            result["package_count"] = len(
-                output.splitlines()
-            )
+    if output:
+        result["package_count"] = len(output.splitlines())
 
     return result
 
 
-# ============================================================
-# COMPLETE SERVER PROFILE
-# ============================================================
-
 def collect_server_info():
-
     network_interfaces = get_network_interfaces()
-
-    addresses = get_host_addresses(
-        network_interfaces
-    )
-
-    ssh_info = get_ssh_info()
-
-    firewall_info = get_firewall_info()
-
     users = get_users()
 
-    sudo_users = get_sudo_users()
-
-    processes = get_processes()
-
-    listening_ports = get_listening_ports()
-
-    active_connections = get_active_connections()
-
-    services = get_services()
-
-    cron_info = get_cron_info()
-
-    software = get_software_info()
-
-    profile = {
-
+    return {
         "agent": {
             "name": AGENT_NAME,
             "version": AGENT_VERSION,
-            "timestamp": datetime.now(
-                timezone.utc
-            ).isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         },
-
         "server": {
             **get_server_info(),
-            "addresses": addresses
+            "addresses": get_host_addresses(network_interfaces)
         },
-
         "os": get_os_info(),
-
         "hardware": {
             "cpu": get_cpu_info(),
             "memory": get_memory_info(),
             "disks": get_disk_info()
         },
-
         "network": {
-
             "interfaces": network_interfaces,
-
-            "listening_ports": listening_ports,
-
-            "active_connections": active_connections
+            "listening_ports": get_listening_ports(),
+            "active_connections": get_active_connections()
         },
-
-        "processes": processes,
-
+        "processes": get_processes(),
         "users": {
             "all": users,
-            "sudo": sudo_users,
-
+            "sudo": get_sudo_users(),
             "human_users": [
                 user["username"]
                 for user in users
                 if user["type"] == "human"
             ],
-
             "login_capable": [
                 user["username"]
                 for user in users
                 if user["login_capable"]
             ]
         },
-
         "security": {
-
-            "ssh": ssh_info,
-
-            "firewall": firewall_info,
-
+            "ssh": get_ssh_info(),
+            "firewall": get_firewall_info(),
             "kernel": get_kernel_security(),
-
-            "cron": cron_info
+            "cron": get_cron_info()
         },
-
-        "services": services,
-
-        "software": software,
-
+        "services": get_services(),
+        "software": get_software_info(),
         "packages": get_package_info(),
-
         "system": {
             "uptime": get_uptime()
         }
     }
 
-    return profile
-
-
-# ============================================================
-# SAVE PROFILE
-# ============================================================
 
 def save_server_info(data):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    temporary_path = None
 
-    with open(
-        SERVER_INFO_FILE,
-        "w",
-        encoding="utf-8"
-    ) as file:
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=DATA_DIR,
+            prefix=".server_info_",
+            suffix=".tmp",
+            delete=False
+        ) as file:
+            temporary_path = Path(file.name)
 
-        json.dump(
-            data,
-            file,
-            indent=4,
-            ensure_ascii=False
-        )
+            json.dump(
+                data,
+                file,
+                indent=4,
+                ensure_ascii=False
+            )
+            file.write("\n")
 
+        try:
+            os.chmod(temporary_path, 0o600)
+        except OSError:
+            pass
 
-# ============================================================
-# MAIN
-# ============================================================
+        temporary_path.replace(SERVER_INFO_FILE)
+
+        try:
+            os.chmod(SERVER_INFO_FILE, 0o600)
+        except OSError:
+            pass
+
+    finally:
+        if temporary_path and temporary_path.exists():
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
 
 def main():
-
     print()
-    print("=" * 60)
-    print("SERVERGUARD AGENT")
-    print("=" * 60)
-    print()
+    print("=" * 48)
+    print(AGENT_NAME.upper())
+    print("=" * 48)
 
     print("[*] Collecting server information...")
-
     data = collect_server_info()
 
     print("[*] Saving server profile...")
-
     save_server_info(data)
 
-    print()
-    print("[OK] Server information collected.")
     print(f"[OK] Saved to: {SERVER_INFO_FILE}")
     print()
-
-    print(json.dumps(
-        data,
-        indent=4,
-        ensure_ascii=False
-    ))
-
+    print(json.dumps(data, indent=2, ensure_ascii=False))
     print()
-    print("=" * 60)
-    print("ServerGuard Agent completed.")
-    print("=" * 60)
-    print()
+    print("[OK] Collection completed.")
 
 
 if __name__ == "__main__":
