@@ -1,1646 +1,739 @@
+
 #!/usr/bin/env python3
 
+import ipaddress
 import json
-import os
-import re
 import subprocess
-import sys
 import time
 
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-BASE_DIR = Path(
-    "/opt/serverguard"
-)
-
+BASE_DIR = Path("/opt/serverguard")
 DATA_DIR = BASE_DIR / "data"
 
-PROTECTION_CONFIG_FILE = (
-    DATA_DIR / "protection_config.json"
-)
-
-EVENTS_FILE = (
-    DATA_DIR / "ssh_events.json"
-)
-
-BLOCKS_FILE = (
-    DATA_DIR / "blocked_ips.json"
-)
-
-STATS_FILE = (
-    DATA_DIR / "stats.json"
-)
-
+PROTECTION_CONFIG_FILE = DATA_DIR / "protection_config.json"
+EVENTS_FILE = DATA_DIR / "ssh_events.json"
+BLOCKS_FILE = DATA_DIR / "blocked_ips.json"
+STATS_FILE = DATA_DIR / "stats.json"
 
 MAX_EVENTS = 2000
-
 EVENT_RETENTION_DAYS = 7
-
 CLEANUP_INTERVAL = 60
-
 CONFIG_CHECK_INTERVAL = 5
-
-
-# ============================================================
-# DEFAULT PROTECTION
-# ============================================================
+COMMAND_TIMEOUT = 15
 
 DEFAULT_CONFIG = {
-
     "enabled": True,
-
     "attempts": 5,
-
     "duration": 600,
-
     "permanent": False,
-
     "mode": "ip",
-
-    "whitelist": []
+    "whitelist": [],
 }
 
-
-# ============================================================
-# RUNTIME
-# ============================================================
-
 FAILED_ATTEMPTS = {}
-
+CACHED_CONFIG = dict(DEFAULT_CONFIG)
 LAST_CONFIG_LOAD = 0
 
-CACHED_CONFIG = dict(
-    DEFAULT_CONFIG
-)
 
+def log(message):
+    print(f"[ServerGuard] {message}", flush=True)
 
-# ============================================================
-# LOG
-# ============================================================
-
-def log(
-    message
-):
-
-    print(
-        f"[ServerGuard] {message}",
-        flush=True
-    )
-
-
-# ============================================================
-# DIRECTORIES
-# ============================================================
 
 def ensure_directories():
-
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ============================================================
-# JSON LOAD
-# ============================================================
-
-def load_json(
-    path,
-    default
-):
-
+def run_command(command, timeout=COMMAND_TIMEOUT):
     try:
-
-        if not path.exists():
-
-            return default
-
-        with path.open(
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            data = json.load(
-                file
-            )
-
-        return data
-
-    except Exception as e:
-
-        log(
-            f"JSON load error {path}: {e}"
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
         )
+        return result
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"Command error ({command[0]}): {exc}")
+        return None
 
+
+def load_json(path, default):
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        return default
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"Cannot read {path}: {exc}")
         return default
 
 
-# ============================================================
-# JSON SAVE
-# ============================================================
-
-def save_json(
-    path,
-    data
-):
-
-    temp = path.with_suffix(
-        ".tmp"
-    )
+def save_json(path, data):
+    temporary_path = path.with_suffix(".tmp")
 
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-        path.parent.mkdir(
-            parents=True,
-            exist_ok=True
-        )
+        with temporary_path.open("w", encoding="utf-8") as file:
+            json.dump(data, file, indent=2, ensure_ascii=False)
+            file.write("\n")
 
-        with temp.open(
-            "w",
-            encoding="utf-8"
-        ) as file:
+        temporary_path.replace(path)
 
-            json.dump(
-                data,
-                file,
-                indent=2,
-                ensure_ascii=False
-            )
-
-            file.write(
-                "\n"
-            )
-
-        temp.replace(
-            path
-        )
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
 
         return True
 
-    except Exception as e:
-
-        log(
-            f"JSON save error {path}: {e}"
-        )
+    except (OSError, TypeError, ValueError) as exc:
+        log(f"Cannot save {path}: {exc}")
 
         try:
-
-            if temp.exists():
-
-                temp.unlink()
-
-        except Exception:
-
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
             pass
 
         return False
 
 
-# ============================================================
-# LOAD PROTECTION CONFIG
-# ============================================================
+def as_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, int):
+        return value != 0
+
+    if isinstance(value, str):
+        return value.strip().lower() in {
+            "1", "true", "yes", "on", "enabled"
+        }
+
+    return default
+
 
 def load_protection_config():
-
-    global CACHED_CONFIG
-    global LAST_CONFIG_LOAD
+    global CACHED_CONFIG, LAST_CONFIG_LOAD
 
     now = time.time()
 
-    if (
-        now - LAST_CONFIG_LOAD
-        < CONFIG_CHECK_INTERVAL
-    ):
+    if now - LAST_CONFIG_LOAD < CONFIG_CHECK_INTERVAL:
+        return dict(CACHED_CONFIG)
 
-        return dict(
-            CACHED_CONFIG
-        )
+    data = load_json(PROTECTION_CONFIG_FILE, dict(DEFAULT_CONFIG))
 
-    LAST_CONFIG_LOAD = now
+    if not isinstance(data, dict):
+        data = {}
 
-    data = load_json(
-        PROTECTION_CONFIG_FILE,
-        dict(DEFAULT_CONFIG)
-    )
+    config = dict(DEFAULT_CONFIG)
+    config.update(data)
 
-    if not isinstance(
-        data,
-        dict
-    ):
-
-        data = dict(
-            DEFAULT_CONFIG
-        )
-
-    config = dict(
-        DEFAULT_CONFIG
-    )
-
-    config.update(
-        data
-    )
-
-    # --------------------------------------------------------
-    # ENABLED
-    # --------------------------------------------------------
-
-    enabled = config.get(
-        "enabled",
-        True
-    )
-
-    if isinstance(
-        enabled,
-        str
-    ):
-
-        enabled = (
-            enabled.lower()
-            in (
-                "1",
-                "true",
-                "yes",
-                "on",
-                "enabled"
-            )
-        )
-
-    config["enabled"] = bool(
-        enabled
-    )
-
-    # --------------------------------------------------------
-    # ATTEMPTS
-    # --------------------------------------------------------
+    config["enabled"] = as_bool(config.get("enabled"), True)
+    config["permanent"] = as_bool(config.get("permanent"), False)
 
     try:
-
-        attempts = int(
-            config.get(
-                "attempts",
-                5
-            )
+        config["attempts"] = max(
+            1,
+            min(int(config.get("attempts", 5)), 100),
         )
-
-    except Exception:
-
-        attempts = 5
-
-    config["attempts"] = max(
-        1,
-        min(
-            attempts,
-            100
-        )
-    )
-
-    # --------------------------------------------------------
-    # DURATION
-    # --------------------------------------------------------
+    except (TypeError, ValueError):
+        config["attempts"] = DEFAULT_CONFIG["attempts"]
 
     try:
-
-        duration = int(
-            config.get(
-                "duration",
-                600
-            )
+        config["duration"] = max(
+            60,
+            min(int(config.get("duration", 600)), 30 * 24 * 60 * 60),
         )
+    except (TypeError, ValueError):
+        config["duration"] = DEFAULT_CONFIG["duration"]
 
-    except Exception:
+    whitelist = config.get("whitelist", [])
+    clean_whitelist = []
 
-        duration = 600
+    if isinstance(whitelist, list):
+        for entry in whitelist:
+            try:
+                network = ipaddress.ip_network(str(entry).strip(), strict=False)
+                normalized = str(network)
 
-    config["duration"] = max(
-        60,
-        min(
-            duration,
-            30 * 24 * 60 * 60
-        )
-    )
+                if normalized not in clean_whitelist:
+                    clean_whitelist.append(normalized)
+            except ValueError:
+                log(f"Ignoring invalid whitelist entry: {entry}")
 
-    # --------------------------------------------------------
-    # PERMANENT
-    # --------------------------------------------------------
-
-    permanent = config.get(
-        "permanent",
-        False
-    )
-
-    if isinstance(
-        permanent,
-        str
-    ):
-
-        permanent = (
-            permanent.lower()
-            in (
-                "1",
-                "true",
-                "yes",
-                "on",
-                "enabled"
-            )
-        )
-
-    config["permanent"] = bool(
-        permanent
-    )
-
-    # --------------------------------------------------------
-    # WHITELIST
-    # --------------------------------------------------------
-
-    whitelist = config.get(
-        "whitelist",
-        []
-    )
-
-    if not isinstance(
-        whitelist,
-        list
-    ):
-
-        whitelist = []
-
-    clean = []
-
-    for ip in whitelist:
-
-        ip = str(
-            ip
-        ).strip()
-
-        if ip and ip not in clean:
-
-            clean.append(
-                ip
-            )
-
-    config["whitelist"] = clean
-
-    # --------------------------------------------------------
-    # MODE
-    # --------------------------------------------------------
-
+    config["whitelist"] = clean_whitelist
     config["mode"] = "ip"
 
     CACHED_CONFIG = config
+    LAST_CONFIG_LOAD = now
 
-    return dict(
-        config
-    )
+    return dict(config)
 
 
-# ============================================================
-# DATETIME
-# ============================================================
-
-def utc_iso(
-    timestamp=None
-):
-
+def utc_iso(timestamp=None):
     if timestamp is None:
-
         timestamp = time.time()
 
     return datetime.fromtimestamp(
         timestamp,
-        tz=timezone.utc
+        tz=timezone.utc,
     ).isoformat()
 
 
-# ============================================================
-# EVENTS
-# ============================================================
-
 def load_events():
-
-    data = load_json(
-        EVENTS_FILE,
-        []
-    )
-
-    if not isinstance(
-        data,
-        list
-    ):
-
-        return []
-
-    return data
+    data = load_json(EVENTS_FILE, [])
+    return data if isinstance(data, list) else []
 
 
-def save_event(
-    event_type,
-    ip,
-    username="unknown",
-    auth_method="",
-    raw=""
-):
-
+def save_event(event_type, ip, username="unknown", auth_method="", raw=""):
     events = load_events()
+    now = int(time.time())
 
-    event = {
+    events.append({
+        "time": now,
+        "time_iso": utc_iso(now),
+        "type": event_type,
+        "username": username,
+        "ip": ip,
+        "auth_method": auth_method,
+        "raw": raw[:1000],
+    })
 
-        "time":
-            int(time.time()),
+    save_json(EVENTS_FILE, events[-MAX_EVENTS:])
 
-        "time_iso":
-            utc_iso(),
-
-        "type":
-            event_type,
-
-        "username":
-            username,
-
-        "ip":
-            ip,
-
-        "auth_method":
-            auth_method,
-
-        "raw":
-            raw
-    }
-
-    events.append(
-        event
-    )
-
-    if len(events) > MAX_EVENTS:
-
-        events = events[
-            -MAX_EVENTS:
-        ]
-
-    save_json(
-        EVENTS_FILE,
-        events
-    )
-
-
-# ============================================================
-# BLOCKS
-# ============================================================
 
 def load_blocks():
-
-    data = load_json(
-        BLOCKS_FILE,
-        {}
-    )
-
-    if not isinstance(
-        data,
-        dict
-    ):
-
-        return {}
-
-    return data
+    data = load_json(BLOCKS_FILE, {})
+    return data if isinstance(data, dict) else {}
 
 
-def save_blocks(
-    blocks
-):
+def save_blocks(blocks):
+    save_json(BLOCKS_FILE, blocks)
 
-    save_json(
-        BLOCKS_FILE,
-        blocks
-    )
-
-
-# ============================================================
-# STATS
-# ============================================================
 
 def load_stats():
-
-    data = load_json(
-        STATS_FILE,
-        {}
-    )
-
-    if not isinstance(
-        data,
-        dict
-    ):
-
-        data = {}
-
-    return data
+    data = load_json(STATS_FILE, {})
+    return data if isinstance(data, dict) else {}
 
 
-def update_stat(
-    name
-):
-
+def update_stat(name):
     stats = load_stats()
 
     try:
-
-        stats[name] = (
-            int(
-                stats.get(
-                    name,
-                    0
-                )
-            )
-            + 1
-        )
-
-    except Exception:
-
+        stats[name] = int(stats.get(name, 0)) + 1
+    except (TypeError, ValueError):
         stats[name] = 1
 
-    save_json(
-        STATS_FILE,
-        stats
-    )
+    save_json(STATS_FILE, stats)
 
 
-# ============================================================
-# UFW CHECK
-# ============================================================
-
-def ufw_is_blocked(
-    ip
-):
-
+def normalize_ip(value):
     try:
-
-        result = subprocess.run(
-
-            [
-                "ufw",
-                "status"
-            ],
-
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-
-        if result.returncode != 0:
-
-            return False
-
-        return (
-            ip in result.stdout
-            and
-            "DENY" in result.stdout
-        )
-
-    except Exception as e:
-
-        log(
-            f"UFW status error: {e}"
-        )
-
-        return False
+        return str(ipaddress.ip_address(value.strip()))
+    except (ValueError, AttributeError):
+        return None
 
 
-# ============================================================
-# UFW BLOCK
-# ============================================================
+def get_local_ips():
+    addresses = {"127.0.0.1", "::1"}
 
-def ufw_block(
-    ip
-):
+    result = run_command(["hostname", "-I"], timeout=5)
 
+    if result and result.returncode == 0:
+        for value in result.stdout.split():
+            address = normalize_ip(value)
+
+            if address:
+                addresses.add(address)
+
+    return addresses
+
+
+def is_whitelisted(ip, config):
     try:
-
-        if ufw_is_blocked(
-            ip
-        ):
-
-            return True
-
-        result = subprocess.run(
-
-            [
-                "ufw",
-                "insert",
-                "1",
-                "deny",
-                "from",
-                ip
-            ],
-
-            capture_output=True,
-            text=True,
-            timeout=15
-        )
-
-        if result.returncode == 0:
-
-            log(
-                f"[BLOCK] {ip}"
-            )
-
-            return True
-
-        log(
-            f"[BLOCK ERROR] {ip}: "
-            f"{result.stderr.strip()}"
-        )
-
+        address = ipaddress.ip_address(ip)
+    except ValueError:
         return False
 
-    except Exception as e:
+    for entry in config.get("whitelist", []):
+        try:
+            if address in ipaddress.ip_network(entry, strict=False):
+                return True
+        except ValueError:
+            continue
 
-        log(
-            f"[BLOCK ERROR] {ip}: {e}"
-        )
+    return False
 
+
+def ufw_is_blocked(ip):
+    result = run_command(["ufw", "status"])
+
+    if not result or result.returncode != 0:
         return False
 
+    for line in result.stdout.splitlines():
+        fields = line.split()
 
-# ============================================================
-# UFW UNBLOCK
-# ============================================================
+        if len(fields) < 2:
+            continue
 
-def ufw_unblock(
-    ip
-):
+        if fields[0] != ip:
+            continue
 
-    try:
-
-        result = subprocess.run(
-
-            [
-                "ufw",
-                "delete",
-                "deny",
-                "from",
-                ip
-            ],
-
-            capture_output=True,
-            text=True,
-            timeout=15
-        )
-
-        if result.returncode == 0:
-
-            log(
-                f"[UNBLOCK] {ip}"
-            )
-
+        if fields[1].upper() in {"DENY", "REJECT"}:
             return True
 
-        output = (
-            result.stdout
-            + "\n"
-            + result.stderr
-        ).lower()
+    return False
 
-        if (
-            "could not delete" in output
-            or
-            "not found" in output
-            or
-            "no rules found" in output
-        ):
 
-            return True
-
-        log(
-            f"[UNBLOCK ERROR] {ip}: "
-            f"{result.stderr.strip()}"
-        )
-
+def ufw_block(ip):
+    if not normalize_ip(ip):
+        log(f"Refusing to block invalid IP: {ip}")
         return False
 
-    except Exception as e:
+    if ufw_is_blocked(ip):
+        return True
 
-        log(
-            f"[UNBLOCK ERROR] {ip}: {e}"
-        )
+    result = run_command([
+        "ufw", "insert", "1", "deny", "from", ip
+    ])
 
+    if result and result.returncode == 0:
+        log(f"[BLOCK] {ip}")
+        return True
+
+    error = result.stderr.strip() if result else "command failed"
+    log(f"[BLOCK ERROR] {ip}: {error}")
+    return False
+
+
+def ufw_unblock(ip):
+    if not normalize_ip(ip):
         return False
 
+    result = run_command([
+        "ufw", "delete", "deny", "from", ip
+    ])
 
-# ============================================================
-# WHITELIST
-# ============================================================
+    if result and result.returncode == 0:
+        log(f"[UNBLOCK] {ip}")
+        return True
 
-def is_whitelisted(
-    ip,
-    config
-):
+    output = ""
+    if result:
+        output = f"{result.stdout}\n{result.stderr}".lower()
 
-    return ip in config.get(
-        "whitelist",
-        []
-    )
+    if any(message in output for message in (
+        "could not delete",
+        "not found",
+        "no rules found",
+        "could not find",
+    )):
+        return True
+
+    error = result.stderr.strip() if result else "command failed"
+    log(f"[UNBLOCK ERROR] {ip}: {error}")
+    return False
 
 
-# ============================================================
-# CREATE BLOCK RECORD
-# ============================================================
-
-def create_block(
-    ip,
-    failed_attempts,
-    config
-):
-
-    now = int(
-        time.time()
-    )
-
-    permanent = bool(
-        config.get(
-            "permanent",
-            False
-        )
-    )
-
-    duration = int(
-        config.get(
-            "duration",
-            600
-        )
-    )
-
-    if permanent:
-
-        expires_at = None
-
-    else:
-
-        expires_at = (
-            now
-            + duration
-        )
+def create_block(ip, failed_attempts, config):
+    now = int(time.time())
+    permanent = config["permanent"]
+    duration = config["duration"]
+    expires_at = None if permanent else now + duration
 
     blocks = load_blocks()
 
     blocks[ip] = {
-
-        "ip":
-            ip,
-
-        "blocked_at":
-            now,
-
-        "blocked_at_iso":
-            utc_iso(now),
-
-        "failed_attempts":
-            failed_attempts,
-
-        "permanent":
-            permanent,
-
-        "duration":
-            duration,
-
-        "expires_at":
-            expires_at,
-
-        "expires_at_iso":
-            (
-                None
-                if expires_at is None
-                else
-                utc_iso(expires_at)
-            ),
-
-        "reason":
-            "SSH brute-force protection"
+        "ip": ip,
+        "blocked_at": now,
+        "blocked_at_iso": utc_iso(now),
+        "failed_attempts": failed_attempts,
+        "permanent": permanent,
+        "duration": duration,
+        "expires_at": expires_at,
+        "expires_at_iso": utc_iso(expires_at) if expires_at else None,
+        "reason": "SSH brute-force protection",
     }
 
-    save_blocks(
-        blocks
-    )
+    save_blocks(blocks)
 
 
-# ============================================================
-# BLOCK IP
-# ============================================================
+def block_ip(ip, failed_attempts, config):
+    address = normalize_ip(ip)
 
-def block_ip(
-    ip,
-    failed_attempts,
-    config
-):
-
-    if is_whitelisted(
-        ip,
-        config
-    ):
-
-        log(
-            f"[WHITELIST] "
-            f"Skipping block for {ip}"
-        )
-
+    if not address:
+        log(f"[SAFETY] Invalid IP ignored: {ip}")
         return False
 
-    if ip in get_local_ips():
-
-        log(
-            f"[SAFETY] "
-            f"Skipping local/server IP {ip}"
-        )
-
+    if is_whitelisted(address, config):
+        log(f"[WHITELIST] Skipping {address}")
         return False
 
-    success = ufw_block(
-        ip
-    )
-
-    if not success:
-
+    if address in get_local_ips():
+        log(f"[SAFETY] Skipping local/server IP {address}")
         return False
 
-    create_block(
-        ip,
-        failed_attempts,
-        config
-    )
+    if not ufw_block(address):
+        return False
 
-    update_stat(
-        "blocked"
-    )
+    create_block(address, failed_attempts, config)
+    update_stat("blocked")
 
-    if config.get(
-        "permanent",
-        False
-    ):
-
-        log(
-            f"[BLOCK] {ip} "
-            f"PERMANENT "
-            f"after {failed_attempts} failed attempts"
-        )
-
+    if config["permanent"]:
+        log(f"{address} blocked permanently after {failed_attempts} failed attempts")
     else:
-
-        log(
-            f"[BLOCK] {ip} "
-            f"for {config['duration']} seconds "
-            f"after {failed_attempts} failed attempts"
-        )
+        log(f"{address} blocked for {config['duration']} seconds")
 
     return True
 
 
-# ============================================================
-# LOCAL SERVER IPS
-# ============================================================
-
-def get_local_ips():
-
-    result = set()
-
-    try:
-
-        output = subprocess.check_output(
-
-            [
-                "hostname",
-                "-I"
-            ],
-
-            text=True,
-            timeout=5
-        )
-
-        for ip in output.split():
-
-            result.add(
-                ip.strip()
-            )
-
-    except Exception:
-        pass
-
-    result.add(
-        "127.0.0.1"
-    )
-
-    result.add(
-        "::1"
-    )
-
-    return result
-
-
-# ============================================================
-# EXPIRE BLOCKS
-# ============================================================
-
 def expire_blocks():
-
     blocks = load_blocks()
 
     if not blocks:
-
         return
 
-    now = int(
-        time.time()
-    )
-
+    now = int(time.time())
     changed = False
 
-    for ip in list(
-        blocks.keys()
-    ):
-
-        block = blocks.get(
-            ip
-        )
-
-        if not isinstance(
-            block,
-            dict
-        ):
-
+    for ip, block in list(blocks.items()):
+        if not isinstance(block, dict):
             del blocks[ip]
-
             changed = True
-
             continue
 
-        if block.get(
-            "permanent",
-            False
-        ):
-
+        if block.get("permanent", False):
             continue
 
-        expires_at = block.get(
-            "expires_at"
-        )
-
-        if expires_at is None:
-
-            continue
+        expires_at = block.get("expires_at")
 
         try:
-
-            expires_at = int(
-                expires_at
-            )
-
-        except Exception:
-
-            del blocks[ip]
-
-            changed = True
-
+            expires_at = int(expires_at)
+        except (TypeError, ValueError):
             continue
 
-        if expires_at <= now:
+        if expires_at > now:
+            continue
 
-            if ufw_unblock(
-                ip
-            ):
-
-                del blocks[ip]
-
-                changed = True
-
-                update_stat(
-                    "unblocked"
-                )
-
-                log(
-                    f"[EXPIRED] "
-                    f"{ip} temporary block expired"
-                )
+        if ufw_unblock(ip):
+            del blocks[ip]
+            changed = True
+            update_stat("unblocked")
+            log(f"[EXPIRED] Temporary block expired for {ip}")
 
     if changed:
+        save_blocks(blocks)
 
-        save_blocks(
-            blocks
-        )
-
-
-# ============================================================
-# CLEAN OLD EVENTS
-# ============================================================
 
 def cleanup_events():
-
     events = load_events()
-
-    if not events:
-
-        return
-
-    cutoff = (
-        time.time()
-        - (
-            EVENT_RETENTION_DAYS
-            * 86400
-        )
-    )
-
+    cutoff = int(time.time() - EVENT_RETENTION_DAYS * 86400)
     cleaned = []
 
     for event in events:
-
-        if not isinstance(
-            event,
-            dict
-        ):
-
+        if not isinstance(event, dict):
             continue
-
-        timestamp = event.get(
-            "time"
-        )
 
         try:
-
-            timestamp = int(
-                timestamp
-            )
-
-        except Exception:
-
-            timestamp = int(
-                time.time()
-            )
+            timestamp = int(event.get("time", 0))
+        except (TypeError, ValueError):
+            continue
 
         if timestamp >= cutoff:
+            cleaned.append(event)
 
-            cleaned.append(
-                event
-            )
-
-    if len(cleaned) > MAX_EVENTS:
-
-        cleaned = cleaned[
-            -MAX_EVENTS:
-        ]
+    cleaned = cleaned[-MAX_EVENTS:]
 
     if len(cleaned) != len(events):
+        save_json(EVENTS_FILE, cleaned)
 
-        save_json(
-            EVENTS_FILE,
-            cleaned
-        )
-
-
-# ============================================================
-# CLEAN RUNTIME COUNTERS
-# ============================================================
 
 def cleanup_attempts():
-
     now = time.time()
 
-    for ip in list(
-        FAILED_ATTEMPTS.keys()
-    ):
-
-        data = FAILED_ATTEMPTS.get(
-            ip
-        )
-
-        if not isinstance(
-            data,
-            dict
-        ):
-
+    for ip, data in list(FAILED_ATTEMPTS.items()):
+        if not isinstance(data, dict):
             del FAILED_ATTEMPTS[ip]
-
             continue
 
-        last = data.get(
-            "last"
-        )
-
-        if last is None:
-
+        try:
+            last = float(data["last"])
+        except (KeyError, TypeError, ValueError):
             del FAILED_ATTEMPTS[ip]
-
             continue
 
-        if (
-            now - last
-            > 3600
-        ):
-
+        if now - last > 3600:
             del FAILED_ATTEMPTS[ip]
 
 
-# ============================================================
-# PARSE FAILED SSH LOGIN
-# ============================================================
-
-FAILED_PATTERNS = [
-
-    re.compile(
-        r"Failed password for (?:invalid user )?(\S+) from ([0-9a-fA-F\.:]+)"
+FAILED_PATTERNS = (
+    (
+        "failed_password",
+        __import__("re").compile(
+            r"Failed password for (?:invalid user )?(\S+) from ([0-9a-fA-F:.]+)"
+        ),
     ),
-
-    re.compile(
-        r"Failed publickey for (?:invalid user )?(\S+) from ([0-9a-fA-F\.:]+)"
+    (
+        "failed_publickey",
+        __import__("re").compile(
+            r"Failed publickey for (?:invalid user )?(\S+) from ([0-9a-fA-F:.]+)"
+        ),
     ),
-
-    re.compile(
-        r"Invalid user (\S+) from ([0-9a-fA-F\.:]+)"
+    (
+        "invalid_user",
+        __import__("re").compile(
+            r"Invalid user (\S+) from ([0-9a-fA-F:.]+)"
+        ),
     ),
-
-    re.compile(
-        r"authentication failure.*rhost=([0-9a-fA-F\.:]+)"
-    )
-]
-
-
-# ============================================================
-# PARSE SUCCESSFUL SSH LOGIN
-# ============================================================
-
-SUCCESS_PATTERNS = [
-
-    re.compile(
-        r"Accepted password for (\S+) from ([0-9a-fA-F\.:]+)"
+    (
+        "authentication_failure",
+        __import__("re").compile(
+            r"authentication failure.*rhost=([0-9a-fA-F:.]+)",
+            __import__("re").IGNORECASE,
+        ),
     ),
+)
 
-    re.compile(
-        r"Accepted publickey for (\S+) from ([0-9a-fA-F\.:]+)"
+SUCCESS_PATTERNS = (
+    (
+        "password",
+        __import__("re").compile(
+            r"Accepted password for (\S+) from ([0-9a-fA-F:.]+)"
+        ),
     ),
+    (
+        "publickey",
+        __import__("re").compile(
+            r"Accepted publickey for (\S+) from ([0-9a-fA-F:.]+)"
+        ),
+    ),
+    (
+        "keyboard-interactive",
+        __import__("re").compile(
+            r"Accepted keyboard-interactive/pam for (\S+) from ([0-9a-fA-F:.]+)"
+        ),
+    ),
+)
 
-    re.compile(
-        r"Accepted keyboard-interactive/pam for (\S+) from ([0-9a-fA-F\.:]+)"
-    )
-]
 
+def handle_failed_login(username, ip, raw, event_type="failed"):
+    address = normalize_ip(ip)
 
-# ============================================================
-# HANDLE FAILED LOGIN
-# ============================================================
+    if not address:
+        return
 
-def handle_failed_login(
-    username,
-    ip,
-    raw
-):
-
+    username = username or "unknown"
     config = load_protection_config()
 
-    save_event(
-        "failed",
-        ip,
-        username,
-        "",
-        raw
-    )
+    save_event(event_type, address, username, "", raw)
+    update_stat("failed")
 
-    update_stat(
-        "failed"
-    )
-
-    if not config.get(
-        "enabled",
-        True
-    ):
-
+    if not config["enabled"]:
         return
 
-    if is_whitelisted(
-        ip,
-        config
-    ):
-
-        log(
-            f"[WHITELIST] "
-            f"Failed SSH from {ip}"
-        )
-
+    if is_whitelisted(address, config):
+        log(f"[WHITELIST] Failed SSH from {address}")
         return
 
-    current = FAILED_ATTEMPTS.get(
-        ip,
-        {
-            "count": 0,
-            "last": 0
-        }
+    current = FAILED_ATTEMPTS.setdefault(
+        address,
+        {"count": 0, "last": 0},
     )
 
-    current["count"] = (
-        int(
-            current.get(
-                "count",
-                0
-            )
-        )
-        + 1
-    )
-
+    current["count"] += 1
     current["last"] = time.time()
 
-    FAILED_ATTEMPTS[
-        ip
-    ] = current
-
-    attempts = current[
-        "count"
-    ]
-
-    threshold = int(
-        config.get(
-            "attempts",
-            5
-        )
-    )
+    attempts = current["count"]
+    threshold = config["attempts"]
 
     log(
-        f"[SSH FAILED] "
-        f"IP={ip} "
-        f"user={username} "
-        f"attempt={attempts}/{threshold}"
+        f"[SSH FAILED] IP={address} "
+        f"user={username} attempt={attempts}/{threshold}"
     )
 
     if attempts < threshold:
-
         return
 
     blocks = load_blocks()
+    existing = blocks.get(address)
 
-    existing = blocks.get(
-        ip
-    )
-
-    if isinstance(
-        existing,
-        dict
-    ):
-
-        if existing.get(
-            "permanent",
-            False
-        ):
-
+    if isinstance(existing, dict):
+        if existing.get("permanent", False):
             return
 
-        expires_at = existing.get(
-            "expires_at"
-        )
+        try:
+            if int(existing.get("expires_at", 0)) > int(time.time()):
+                return
+        except (TypeError, ValueError):
+            pass
 
-        if expires_at:
-
-            try:
-
-                if int(
-                    expires_at
-                ) > int(
-                    time.time()
-                ):
-
-                    return
-
-            except Exception:
-
-                pass
-
-    if block_ip(
-        ip,
-        attempts,
-        config
-    ):
-
-        FAILED_ATTEMPTS.pop(
-            ip,
-            None
-        )
+    if block_ip(address, attempts, config):
+        FAILED_ATTEMPTS.pop(address, None)
 
 
-# ============================================================
-# HANDLE SUCCESSFUL LOGIN
-# ============================================================
+def handle_success_login(username, ip, auth_method, raw):
+    address = normalize_ip(ip)
 
-def handle_success_login(
-    username,
-    ip,
-    auth_method,
-    raw
-):
+    if not address:
+        return
 
-    save_event(
-        "success",
-        ip,
-        username,
-        auth_method,
-        raw
-    )
+    save_event("success", address, username, auth_method, raw)
+    update_stat("success")
 
-    update_stat(
-        "success"
-    )
-
-    if ip in FAILED_ATTEMPTS:
-
-        del FAILED_ATTEMPTS[
-            ip
-        ]
-
-        log(
-            f"[SSH SUCCESS] "
-            f"{ip} counter reset"
-        )
-
+    if address in FAILED_ATTEMPTS:
+        del FAILED_ATTEMPTS[address]
+        log(f"[SSH SUCCESS] Counter reset for {address}")
     else:
-
-        log(
-            f"[SSH SUCCESS] "
-            f"{ip}"
-        )
+        log(f"[SSH SUCCESS] {address}")
 
 
-# ============================================================
-# PROCESS LINE
-# ============================================================
-
-def process_line(
-    line
-):
+def process_line(line):
+    line = line.strip()
 
     if not line:
-
         return
 
-    # --------------------------------------------------------
-    # SUCCESS
-    # --------------------------------------------------------
-
-    for pattern in SUCCESS_PATTERNS:
-
-        match = pattern.search(
-            line
-        )
+    for auth_method, pattern in SUCCESS_PATTERNS:
+        match = pattern.search(line)
 
         if match:
-
-            username = match.group(
-                1
-            )
-
-            ip = match.group(
-                2
-            )
-
-            if "publickey" in line:
-
-                auth_method = "publickey"
-
-            elif "keyboard-interactive" in line:
-
-                auth_method = (
-                    "keyboard-interactive"
-                )
-
-            else:
-
-                auth_method = "password"
-
             handle_success_login(
-
-                username,
-                ip,
+                match.group(1),
+                match.group(2),
                 auth_method,
-                line.strip()
+                line,
             )
-
             return
 
-    # --------------------------------------------------------
-    # FAILED
-    # --------------------------------------------------------
-
-    for pattern in FAILED_PATTERNS:
-
-        match = pattern.search(
-            line
-        )
+    for event_type, pattern in FAILED_PATTERNS:
+        match = pattern.search(line)
 
         if not match:
-
             continue
 
-        groups = match.groups()
-
-        if len(groups) >= 2:
-
-            username = groups[0]
-            ip = groups[1]
-
-        else:
-
+        if event_type == "authentication_failure":
             username = "unknown"
-            ip = groups[0]
+            ip = match.group(1)
+        else:
+            username = match.group(1)
+            ip = match.group(2)
 
         handle_failed_login(
-
             username,
             ip,
-            line.strip()
+            line,
+            event_type,
         )
-
         return
 
 
-# ============================================================
-# JOURNAL PROCESS
-# ============================================================
-
 def run_journal():
-
     command = [
-
         "journalctl",
-
         "-f",
-
-        "-n",
-        "0",
-
-        "-u",
-        "ssh",
-
-        "-u",
-        "sshd",
-
-        "-o",
-        "cat"
+        "-n", "0",
+        "-u", "ssh",
+        "-u", "sshd",
+        "-o", "cat",
     ]
 
-    log(
-        "Starting SSH journal monitor..."
-    )
+    log("Starting SSH journal monitor...")
 
     while True:
-
         process = None
 
         try:
-
             process = subprocess.Popen(
-
                 command,
-
                 stdout=subprocess.PIPE,
-
-                stderr=subprocess.STDOUT,
-
+                stderr=subprocess.PIPE,
                 text=True,
-
-                bufsize=1
+                bufsize=1,
             )
 
-            for line in process.stdout:
+            if process.stdout is None:
+                raise RuntimeError("Could not open journal output")
 
-                process_line(
-                    line
-                )
+            while True:
+                line = process.stdout.readline()
 
-                expire_blocks()
+                if line:
+                    process_line(line)
+                    continue
+
+                if process.poll() is not None:
+                    error = ""
+
+                    if process.stderr:
+                        error = process.stderr.read().strip()
+
+                    if error:
+                        log(f"journalctl: {error}")
+
+                    break
+
+                now = time.time()
+
+                if now - run_journal.last_cleanup >= CLEANUP_INTERVAL:
+                    expire_blocks()
+                    cleanup_events()
+                    cleanup_attempts()
+                    run_journal.last_cleanup = now
+
+                time.sleep(0.2)
 
         except KeyboardInterrupt:
-
-            if process:
-
-                process.terminate()
-
             raise
 
-        except Exception as e:
-
-            log(
-                f"Journal error: {e}"
-            )
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            log(f"Journal error: {exc}")
 
         finally:
-
-            if process:
+            if process and process.poll() is None:
+                process.terminate()
 
                 try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
 
-                    process.terminate()
-
-                except Exception:
-
-                    pass
-
-        log(
-            "SSH journal stopped. "
-            "Restarting in 3 seconds..."
-        )
-
-        time.sleep(
-            3
-        )
+        log("SSH journal stopped. Restarting in 3 seconds...")
+        time.sleep(3)
 
 
-# ============================================================
-# MAIN
-# ============================================================
+run_journal.last_cleanup = 0
+
 
 def main():
-
     ensure_directories()
 
-    log(
-        "========================================"
-    )
-
-    log(
-        "     ServerGuard Brute Force Guard"
-    )
-
-    log(
-        "========================================"
-    )
+    log("========================================")
+    log("ServerGuard Brute Force Guard")
+    log("========================================")
 
     config = load_protection_config()
 
-    log(
-        f"Protection: "
-        f"{'ON' if config['enabled'] else 'OFF'}"
-    )
-
-    log(
-        f"Block after: "
-        f"{config['attempts']} failed attempts"
-    )
+    log(f"Protection: {'ON' if config['enabled'] else 'OFF'}")
+    log(f"Block after: {config['attempts']} failed attempts")
 
     if config["permanent"]:
-
-        log(
-            "Block type: PERMANENT"
-        )
-
+        log("Block type: PERMANENT")
     else:
+        log(f"Block type: TEMPORARY ({config['duration']} seconds)")
 
-        log(
-            f"Block type: TEMPORARY "
-            f"({config['duration']} seconds)"
-        )
+    log(f"Whitelist entries: {len(config['whitelist'])}")
 
-    log(
-        f"Whitelist: "
-        f"{len(config['whitelist'])} IP(s)"
-    )
-
-    last_cleanup = 0
-
-    while True:
-
-        try:
-
-            now = time.time()
-
-            if (
-                now - last_cleanup
-                >= CLEANUP_INTERVAL
-            ):
-
-                expire_blocks()
-
-                cleanup_events()
-
-                cleanup_attempts()
-
-                last_cleanup = now
-
-            run_journal()
-
-        except KeyboardInterrupt:
-
-            log(
-                "Stopped."
-            )
-
-            break
-
-        except Exception as e:
-
-            log(
-                f"Fatal error: {e}"
-            )
-
-            time.sleep(
-                5
-            )
+    try:
+        run_journal()
+    except KeyboardInterrupt:
+        log("Stopped.")
 
 
 if __name__ == "__main__":
-
     main()
