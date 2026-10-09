@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 
 import sys
@@ -6,10 +7,6 @@ import shutil
 import subprocess
 from datetime import datetime
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
 SERVERGUARD_DIR = "/opt/serverguard"
 BACKUP_DIR = os.path.join(SERVERGUARD_DIR, "backups")
@@ -22,21 +19,12 @@ SSH_SERVICE_NAMES = [
     "sshd"
 ]
 
-
-# ============================================================
-# COLORS
-# ============================================================
-
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
 CYAN = "\033[96m"
 RESET = "\033[0m"
 
-
-# ============================================================
-# COMMAND EXECUTION
-# ============================================================
 
 def run_command(command, check=False):
     try:
@@ -54,10 +42,6 @@ def run_command(command, check=False):
         return 1, "", str(e)
 
 
-# ============================================================
-# ROOT CHECK
-# ============================================================
-
 def check_root():
     if os.geteuid() != 0:
         print(
@@ -67,10 +51,6 @@ def check_root():
 
     return True
 
-
-# ============================================================
-# CREATE DIRECTORIES
-# ============================================================
 
 def create_directories():
     try:
@@ -95,13 +75,8 @@ def create_directories():
         return False
 
 
-# ============================================================
-# SSH SERVICE
-# ============================================================
-
 def get_ssh_service():
     for service in SSH_SERVICE_NAMES:
-
         code, _, _ = run_command(
             [
                 "systemctl",
@@ -126,10 +101,6 @@ def get_ssh_service():
 
     return None
 
-
-# ============================================================
-# CHECK SSH SERVICE
-# ============================================================
 
 def check_ssh_service():
     service = get_ssh_service()
@@ -164,19 +135,12 @@ def check_ssh_service():
     return False
 
 
-# ============================================================
-# BACKUP MAIN CONFIGURATION
-# ============================================================
-
 def backup_main_config():
-
     if not os.path.exists(MAIN_SSH_CONFIG):
-
         print(
             f"{RED}Main SSH configuration does not exist:{RESET} "
             f"{MAIN_SSH_CONFIG}"
         )
-
         return None
 
     timestamp = datetime.now().strftime(
@@ -189,7 +153,6 @@ def backup_main_config():
     )
 
     try:
-
         shutil.copy2(
             MAIN_SSH_CONFIG,
             backup_file
@@ -198,28 +161,20 @@ def backup_main_config():
         print(
             f"{GREEN}Main SSH configuration backed up:{RESET}"
         )
-
         print(backup_file)
 
         return backup_file
 
     except Exception as e:
-
         print(
             f"{RED}Cannot create SSH configuration backup:{RESET}"
         )
-
         print(e)
 
         return None
 
 
-# ============================================================
-# BACKUP SERVERGUARD HARDENING CONFIG
-# ============================================================
-
 def backup_hardening_config():
-
     if not os.path.exists(HARDENING_CONFIG):
         return None
 
@@ -233,7 +188,6 @@ def backup_hardening_config():
     )
 
     try:
-
         shutil.copy2(
             HARDENING_CONFIG,
             backup_file
@@ -243,71 +197,37 @@ def backup_hardening_config():
             f"{GREEN}Current ServerGuard hardening "
             f"configuration backed up:{RESET}"
         )
-
         print(backup_file)
 
         return backup_file
 
     except Exception as e:
-
         print(
             f"{RED}Cannot backup hardening configuration:{RESET}"
         )
-
         print(e)
 
         return None
 
 
-# ============================================================
-# CREATE HARDENING CONFIG
-# ============================================================
-
 def create_hardening_config():
-
     print()
     print(
         "Creating ServerGuard SSH hardening configuration..."
     )
     print()
 
-    config = """# ============================================================
-# ServerGuard SSH Hardening
-# ============================================================
-#
-# This file is managed by ServerGuard.
-#
-# Generated automatically.
-# ============================================================
-
-# Do not allow empty passwords
-PermitEmptyPasswords no
-
-# Disable X11 forwarding
+    config = """PermitEmptyPasswords no
 X11Forwarding no
-
-# Disable TCP forwarding
 AllowTcpForwarding no
-
-# Disable SSH agent forwarding
 AllowAgentForwarding no
-
-# Limit authentication attempts
 MaxAuthTries 3
-
-# Give clients limited time to authenticate
 LoginGraceTime 30
-
-# Disable SSH compression
 Compression no
-
-# Do not allow root password login
-# Root SSH keys remain available.
 PermitRootLogin prohibit-password
 """
 
     try:
-
         os.makedirs(
             os.path.dirname(HARDENING_CONFIG),
             exist_ok=True
@@ -318,7 +238,6 @@ PermitRootLogin prohibit-password
             "w",
             encoding="utf-8"
         ) as file:
-
             file.write(config)
 
         os.chmod(
@@ -329,28 +248,20 @@ PermitRootLogin prohibit-password
         print(
             f"{GREEN}Hardening configuration created:{RESET}"
         )
-
         print(HARDENING_CONFIG)
 
         return True
 
     except Exception as e:
-
         print(
             f"{RED}Cannot create hardening configuration:{RESET}"
         )
-
         print(e)
 
         return False
 
 
-# ============================================================
-# SSH CONFIGURATION TEST
-# ============================================================
-
 def validate_ssh_config():
-
     print()
     print(
         "Validating SSH configuration..."
@@ -365,11 +276,9 @@ def validate_ssh_config():
     )
 
     if code == 0:
-
         print(
             f"{GREEN}SSH configuration is VALID.{RESET}"
         )
-
         return True
 
     print(
@@ -385,20 +294,13 @@ def validate_ssh_config():
     return False
 
 
-# ============================================================
-# RELOAD SSH
-# ============================================================
-
 def reload_ssh():
-
     service = get_ssh_service()
 
     if service is None:
-
         print(
             f"{RED}Cannot find SSH service.{RESET}"
         )
-
         return False
 
     print()
@@ -415,11 +317,9 @@ def reload_ssh():
     )
 
     if code == 0:
-
         print(
             f"{GREEN}SSH service reloaded successfully.{RESET}"
         )
-
         return True
 
     print(
@@ -435,12 +335,7 @@ def reload_ssh():
     return False
 
 
-# ============================================================
-# SHOW CURRENT SSH CONFIG
-# ============================================================
-
 def get_effective_config():
-
     code, stdout, stderr = run_command(
         [
             "sshd",
@@ -449,7 +344,6 @@ def get_effective_config():
     )
 
     if code != 0:
-
         print(
             f"{RED}Cannot read effective SSH configuration.{RESET}"
         )
@@ -462,16 +356,10 @@ def get_effective_config():
     return stdout
 
 
-# ============================================================
-# GET SPECIFIC SSH VALUE
-# ============================================================
-
 def get_config_value(config, name):
-
     name = name.lower()
 
     for line in config.splitlines():
-
         line = line.strip()
 
         if not line:
@@ -490,29 +378,11 @@ def get_config_value(config, name):
     return "unknown"
 
 
-# ============================================================
-# CHECK WHETHER VALUE MATCHES
-# ============================================================
-
 def value_matches(actual, expected):
-
     actual = actual.strip().lower()
     expected = expected.strip().lower()
 
-    # OpenSSH may report:
-    #
-    # without-password
-    #
-    # instead of:
-    #
-    # prohibit-password
-    #
-    # They have the same security meaning for root:
-    # root password authentication is disabled,
-    # but public-key authentication remains possible.
-
     if expected == "prohibit-password":
-
         return actual in [
             "prohibit-password",
             "without-password"
@@ -521,12 +391,7 @@ def value_matches(actual, expected):
     return actual == expected
 
 
-# ============================================================
-# CHECK HARDENING
-# ============================================================
-
 def check_hardening():
-
     print()
     print("============================================")
     print("       SERVERGUARD SSH CONFIGURATION")
@@ -534,13 +399,11 @@ def check_hardening():
     print()
 
     if not os.path.exists(HARDENING_CONFIG):
-
         print(
             f"{YELLOW}"
             f"ServerGuard hardening: NOT INSTALLED"
             f"{RESET}"
         )
-
         return False
 
     config = get_effective_config()
@@ -564,36 +427,28 @@ def check_hardening():
     all_good = True
 
     for name, expected in settings:
-
         value = get_config_value(
             config,
             name
         )
 
         if expected is not None:
-
             if value_matches(
                 value,
                 expected
             ):
-
                 print(
                     f"{GREEN}[OK]{RESET} "
                     f"{name}: {value}"
                 )
-
             else:
-
                 print(
                     f"{RED}[FAIL]{RESET} "
                     f"{name}: {value} "
                     f"(expected {expected})"
                 )
-
                 all_good = False
-
         else:
-
             print(
                 f"{CYAN}[INFO]{RESET} "
                 f"{name}: {value}"
@@ -602,15 +457,12 @@ def check_hardening():
     print()
 
     if all_good:
-
         print(
             f"{GREEN}"
             f"ServerGuard hardening: ENABLED"
             f"{RESET}"
         )
-
     else:
-
         print(
             f"{YELLOW}"
             f"ServerGuard hardening: PARTIALLY APPLIED"
@@ -620,42 +472,28 @@ def check_hardening():
     return all_good
 
 
-# ============================================================
-# REMOVE SERVERGUARD HARDENING CONFIGURATION
-# ============================================================
-
 def remove_hardening_config():
-
     if not os.path.exists(HARDENING_CONFIG):
         return True
 
     try:
-
         os.remove(
             HARDENING_CONFIG
         )
-
         return True
 
     except Exception as e:
-
         print(
             f"{RED}"
             f"Cannot remove ServerGuard hardening configuration:"
             f"{RESET}"
         )
-
         print(e)
 
         return False
 
 
-# ============================================================
-# APPLY HARDENING
-# ============================================================
-
 def apply_hardening():
-
     print()
     print("============================================")
     print("          APPLYING SSH HARDENING")
@@ -668,48 +506,28 @@ def apply_hardening():
     if not create_directories():
         return False
 
-    # --------------------------------------------------------
-    # Backup main SSH configuration
-    # --------------------------------------------------------
-
     backup = backup_main_config()
 
     if backup is None:
-
         print(
             f"{RED}"
             f"Hardening cancelled because backup failed."
             f"{RESET}"
         )
-
         return False
 
-    # --------------------------------------------------------
-    # Backup previous ServerGuard configuration
-    # --------------------------------------------------------
-
     backup_hardening_config()
-
-    # --------------------------------------------------------
-    # Create configuration
-    # --------------------------------------------------------
 
     if not create_hardening_config():
         return False
 
-    # --------------------------------------------------------
-    # Validate SSH configuration
-    # --------------------------------------------------------
-
     if not validate_ssh_config():
-
         print()
         print(
             f"{RED}"
             f"SSH configuration became invalid."
             f"{RESET}"
         )
-
         print(
             "Removing ServerGuard hardening configuration..."
         )
@@ -721,33 +539,21 @@ def apply_hardening():
             f"Hardening was rolled back."
             f"{RESET}"
         )
-
         return False
 
-    # --------------------------------------------------------
-    # Reload SSH
-    # --------------------------------------------------------
-
     if not reload_ssh():
-
         print()
         print(
             f"{RED}"
             f"SSH reload failed."
             f"{RESET}"
         )
-
         print(
             "Removing ServerGuard hardening configuration..."
         )
 
         remove_hardening_config()
-
         return False
-
-    # --------------------------------------------------------
-    # Final check
-    # --------------------------------------------------------
 
     print()
     print(
@@ -757,7 +563,6 @@ def apply_hardening():
     success = check_hardening()
 
     if not success:
-
         print()
         print(
             f"{YELLOW}"
@@ -765,12 +570,10 @@ def apply_hardening():
             f"are active."
             f"{RESET}"
         )
-
         print()
         print(
             "ServerGuard hardening was not fully applied."
         )
-
         return False
 
     print()
@@ -779,30 +582,22 @@ def apply_hardening():
         f"============================================"
         f"{RESET}"
     )
-
     print(
         f"{GREEN}"
         f"      SSH HARDENING APPLIED SUCCESSFULLY"
         f"{RESET}"
     )
-
     print(
         f"{GREEN}"
         f"============================================"
         f"{RESET}"
     )
-
     print()
 
     return True
 
 
-# ============================================================
-# LIST BACKUPS
-# ============================================================
-
 def list_backups():
-
     print()
     print("============================================")
     print("           SSH CONFIGURATION BACKUPS")
@@ -810,21 +605,17 @@ def list_backups():
     print()
 
     if not os.path.exists(BACKUP_DIR):
-
         print(
             f"{YELLOW}"
             f"Backup directory does not exist."
             f"{RESET}"
         )
-
         return
 
     files = []
 
     try:
-
         for filename in os.listdir(BACKUP_DIR):
-
             path = os.path.join(
                 BACKUP_DIR,
                 filename
@@ -834,30 +625,21 @@ def list_backups():
                 files.append(filename)
 
     except Exception as e:
-
         print(
             f"{RED}"
             f"Cannot read backup directory:"
             f"{RESET}"
         )
-
         print(e)
-
         return
 
     files.sort(reverse=True)
 
     if not files:
-
         print("No backups found.")
-
         return
 
-    for index, filename in enumerate(
-        files,
-        1
-    ):
-
+    for index, filename in enumerate(files, 1):
         print(
             f"{index}. {filename}"
         )
@@ -865,12 +647,7 @@ def list_backups():
     print()
 
 
-# ============================================================
-# RESTORE FROM MENU
-# ============================================================
-
 def restore_configuration():
-
     print()
     print("============================================")
     print("          RESTORE SSH CONFIGURATION")
@@ -881,19 +658,16 @@ def restore_configuration():
         return False
 
     if not os.path.exists(BACKUP_DIR):
-
         print(
             f"{YELLOW}"
             f"No backup directory found."
             f"{RESET}"
         )
-
         return False
 
     files = []
 
     for filename in os.listdir(BACKUP_DIR):
-
         path = os.path.join(
             BACKUP_DIR,
             filename
@@ -905,20 +679,14 @@ def restore_configuration():
     files.sort(reverse=True)
 
     if not files:
-
         print(
             f"{YELLOW}"
             f"No backups found."
             f"{RESET}"
         )
-
         return False
 
-    for index, filename in enumerate(
-        files,
-        1
-    ):
-
+    for index, filename in enumerate(files, 1):
         print(
             f"{index}. {filename}"
         )
@@ -934,27 +702,22 @@ def restore_configuration():
         return False
 
     try:
-
         index = int(choice) - 1
 
         if index < 0 or index >= len(files):
-
             print(
                 f"{RED}"
                 f"Invalid backup number."
                 f"{RESET}"
             )
-
             return False
 
     except ValueError:
-
         print(
             f"{RED}"
             f"Invalid input."
             f"{RESET}"
         )
-
         return False
 
     selected = files[index]
@@ -969,34 +732,19 @@ def restore_configuration():
         f"Selected backup: {selected}"
     )
 
-    # --------------------------------------------------------
-    # Only restore main sshd_config backups
-    # --------------------------------------------------------
-
-    if not selected.startswith(
-        "sshd_config_"
-    ):
-
+    if not selected.startswith("sshd_config_"):
         print(
             f"{RED}"
             f"This backup is not a main sshd_config backup."
             f"{RESET}"
         )
-
         print(
             "ServerGuard hardening configuration is stored "
             "separately in:"
         )
-
-        print(
-            HARDENING_CONFIG
-        )
+        print(HARDENING_CONFIG)
 
         return False
-
-    # --------------------------------------------------------
-    # Emergency backup
-    # --------------------------------------------------------
 
     timestamp = datetime.now().strftime(
         "%Y%m%d_%H%M%S"
@@ -1008,95 +756,70 @@ def restore_configuration():
     )
 
     try:
-
         shutil.copy2(
             MAIN_SSH_CONFIG,
             emergency_backup
         )
 
     except Exception as e:
-
         print(
             f"{RED}"
             f"Cannot create emergency backup:"
             f"{RESET}"
         )
-
         print(e)
 
         return False
 
-    # --------------------------------------------------------
-    # Restore
-    # --------------------------------------------------------
-
     try:
-
         shutil.copy2(
             backup_path,
             MAIN_SSH_CONFIG
         )
 
     except Exception as e:
-
         print(
             f"{RED}"
             f"Restore failed:"
             f"{RESET}"
         )
-
         print(e)
 
         return False
 
-    # --------------------------------------------------------
-    # Validate restored configuration
-    # --------------------------------------------------------
-
     if not validate_ssh_config():
-
         print()
         print(
             f"{RED}"
             f"Restored configuration is INVALID."
             f"{RESET}"
         )
-
         print(
             "Returning previous configuration..."
         )
 
         try:
-
             shutil.copy2(
                 emergency_backup,
                 MAIN_SSH_CONFIG
             )
 
         except Exception as e:
-
             print(
                 f"{RED}"
                 f"Emergency rollback failed:"
                 f"{RESET}"
             )
-
             print(e)
 
         return False
 
-    # --------------------------------------------------------
-    # Reload SSH
-    # --------------------------------------------------------
-
     if not reload_ssh():
-
         print(
             f"{RED}"
             f"SSH reload failed."
             f"{RESET}"
         )
-
         return False
 
     print()
@@ -1109,64 +832,38 @@ def restore_configuration():
     return True
 
 
-# ============================================================
-# COMMAND: CHECK
-# ============================================================
-
 def command_check():
-
     check_ssh_service()
-
     check_hardening()
 
 
-# ============================================================
-# COMMAND: APPLY
-# ============================================================
-
 def command_apply():
-
     return apply_hardening()
 
 
-# ============================================================
-# COMMAND: RESTORE
-# ============================================================
-
 def command_restore():
-
     if len(sys.argv) < 3:
-
         print(
             "Usage: ssh_hardening.py restore <backup_file>"
         )
-
         return False
 
     backup_name = sys.argv[2]
 
-    # --------------------------------------------------------
-    # Security: prevent path traversal
-    # --------------------------------------------------------
-
     if "/" in backup_name or "\\" in backup_name:
-
         print(
             f"{RED}"
             f"Invalid backup filename."
             f"{RESET}"
         )
-
         return False
 
     if ".." in backup_name:
-
         print(
             f"{RED}"
             f"Invalid backup filename."
             f"{RESET}"
         )
-
         return False
 
     backup_path = os.path.join(
@@ -1175,38 +872,25 @@ def command_restore():
     )
 
     if not os.path.isfile(backup_path):
-
         print(
             f"{RED}"
             f"Backup file not found:"
             f"{RESET}"
         )
-
         print(backup_path)
 
         return False
 
-    # --------------------------------------------------------
-    # Only allow known ServerGuard backup types
-    # --------------------------------------------------------
-
     if not (
         backup_name.startswith("sshd_config_")
-        or
-        backup_name.startswith("before_restore_")
+        or backup_name.startswith("before_restore_")
     ):
-
         print(
             f"{RED}"
             f"Unsupported backup type."
             f"{RESET}"
         )
-
         return False
-
-    # --------------------------------------------------------
-    # Emergency backup before restore
-    # --------------------------------------------------------
 
     timestamp = datetime.now().strftime(
         "%Y%m%d_%H%M%S"
@@ -1218,94 +902,69 @@ def command_restore():
     )
 
     try:
-
         shutil.copy2(
             MAIN_SSH_CONFIG,
             emergency_backup
         )
 
     except Exception as e:
-
         print(
             f"{RED}"
             f"Cannot create emergency backup:"
             f"{RESET}"
         )
-
         print(e)
 
         return False
 
-    # --------------------------------------------------------
-    # Restore
-    # --------------------------------------------------------
-
     try:
-
         shutil.copy2(
             backup_path,
             MAIN_SSH_CONFIG
         )
 
     except Exception as e:
-
         print(
             f"{RED}"
             f"Restore failed:"
             f"{RESET}"
         )
-
         print(e)
 
         return False
 
-    # --------------------------------------------------------
-    # Validate
-    # --------------------------------------------------------
-
     if not validate_ssh_config():
-
         print(
             f"{RED}"
             f"Restored configuration is invalid."
             f"{RESET}"
         )
-
         print(
             "Rolling back to previous configuration..."
         )
 
         try:
-
             shutil.copy2(
                 emergency_backup,
                 MAIN_SSH_CONFIG
             )
 
         except Exception as e:
-
             print(
                 f"{RED}"
                 f"Emergency rollback failed:"
                 f"{RESET}"
             )
-
             print(e)
 
         return False
 
-    # --------------------------------------------------------
-    # Reload
-    # --------------------------------------------------------
-
     if not reload_ssh():
-
         print(
             f"{RED}"
             f"SSH reload failed."
             f"{RESET}"
         )
-
         return False
 
     print(
@@ -1317,14 +976,8 @@ def command_restore():
     return True
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 def main():
-
     if len(sys.argv) < 2:
-
         print()
         print(
             "Usage: ssh_hardening.py "
@@ -1337,21 +990,15 @@ def main():
     command = sys.argv[1].lower()
 
     if command == "check":
-
         command_check()
-
         return 0
 
     if command == "apply":
-
         success = command_apply()
-
         return 0 if success else 1
 
     if command == "restore":
-
         success = command_restore()
-
         return 0 if success else 1
 
     print(
@@ -1359,7 +1006,6 @@ def main():
         f"Unknown command: {command}"
         f"{RESET}"
     )
-
     print()
     print(
         "Usage: ssh_hardening.py "
@@ -1368,10 +1014,6 @@ def main():
 
     return 1
 
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     sys.exit(main())
