@@ -6,6 +6,6 @@
     "installer_version": "0.0.3",
     "installer_url": "https://github.com/Lukas6623/ServerGuardCode/releases/download/V.0.0.3/ServerGuardSetup.exe",
 
-    "web_url": "https://github.com/Lukas6623/serverguard-web/releases/download/v1.0.1/web.zip",
-    "web_sha256": "BC0AB4342F2AAD127BA70F1DA332B4E6ED4C86BF684643BC14AF158A72BC14E1"
+    "web_url": "https://github.com/Lukas6623/serverguard-web/releases/download/v1.0.2/web.zip",
+    "web_sha256": "BC200DD2440FFCD72E29EF9A19F31D0FBC469A1007007E203F9767BE38C35FA6"
 }
