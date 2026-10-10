@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-ServerGuard SSH Hardening — Advanced
-Compatible with Ubuntu and Debian.
+ServerGuard SSH Hardening - Advanced
+Compatible with Ubuntu and Debian. Requires Python 3.8+.
 
 Commands:
-  check                    Read-only SSH/F​​ail2ban/key audit
+  check                    Read-only SSH/Fail2ban/key audit
   apply                    Apply conservative SSH hardening (keeps password auth unchanged)
-  restore [BACKUP_NAME]    Restore a main sshd_config backup; interactive if omitted
+  disable                  Remove the ServerGuard SSH drop-in (with backup and validation)
+  restore [BACKUP_NAME]    Restore a pre-hardening backup; interactive if omitted
   keys                     Audit authorized_keys files without changing them
   fail2ban                 Report Fail2ban SSH jail status
+  fail2ban-setup           Install and configure Fail2ban SSH protection
   audit                    Compare current SSH config files with last audit baseline
   audit-install            Install a periodic systemd audit timer (optional Telegram alerts)
 
@@ -24,6 +26,12 @@ Safety notes:
 - Audit is best-effort: root can tamper with local files; use remote logging for stronger assurance.
 """
 
+import sys
+
+if sys.version_info < (3, 8):
+    sys.stderr.write("ERROR: ServerGuard SSH Hardening requires Python 3.8 or newer.\n")
+    sys.exit(1)
+
 import argparse
 import hashlib
 import json
@@ -32,7 +40,6 @@ import re
 import shutil
 import stat
 import subprocess
-import sys
 import tarfile
 import tempfile
 from datetime import datetime, timezone
@@ -110,10 +117,16 @@ def require_root():
 
 
 def ensure_dirs():
+    # /opt/serverguard stays traversable (755) so the ServerGuard client can
+    # test for the script as a normal user; backups and state remain root-only.
     try:
-        for directory in (SERVERGUARD_DIR, BACKUP_DIR, STATE_DIR):
+        for directory, mode in (
+            (SERVERGUARD_DIR, 0o755),
+            (BACKUP_DIR, 0o700),
+            (STATE_DIR, 0o700),
+        ):
             directory.mkdir(parents=True, exist_ok=True)
-            os.chmod(directory, 0o700)
+            os.chmod(directory, mode)
         return True
     except OSError as exc:
         log(f"Cannot create ServerGuard directories: {exc}", RED)
@@ -124,8 +137,7 @@ def get_sshd_binary():
     for candidate in ("/usr/sbin/sshd", "/sbin/sshd"):
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
-    found = shutil.which("sshd")
-    return found
+    return shutil.which("sshd")
 
 
 def get_ssh_service():
@@ -309,6 +321,11 @@ def check_effective_settings():
             GREEN if good else RED)
         all_good &= good
 
+    if not all_good and HARDENING_CONFIG.exists():
+        log("Hint: make sure /etc/ssh/sshd_config contains "
+            "'Include /etc/ssh/sshd_config.d/*.conf' and that no earlier "
+            "file overrides these keys (sshd uses the first value it reads).", YELLOW)
+
     # Informational only: the module intentionally does not disable password
     # authentication in the default apply mode.
     for key in ("passwordauthentication", "kbdinteractiveauthentication",
@@ -360,10 +377,13 @@ def authorized_keys_audit():
         if account.pw_uid != 0 and account.pw_uid < 1000:
             continue
         home = Path(account.pw_dir) if account.pw_dir else None
-        if not home or not home.is_absolute() or not home.is_dir():
-            continue
-        key_file = home / ".ssh" / "authorized_keys"
-        if not key_file.is_file():
+        try:
+            if not home or not home.is_absolute() or not home.is_dir():
+                continue
+            key_file = home / ".ssh" / "authorized_keys"
+            if not key_file.is_file():
+                continue
+        except OSError:
             continue
         found_any = True
         try:
@@ -380,8 +400,10 @@ def authorized_keys_audit():
                     stripped = line.strip()
                     if not stripped or stripped.startswith("#"):
                         continue
-                    # Handles common authorized_keys lines, including options.
-                    match = re.search(r"\b(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp\d+|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)\s+([A-Za-z0-9+/=]+)", stripped)
+                    match = re.search(
+                        r"\b(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp\d+|"
+                        r"sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)"
+                        r"\s+([A-Za-z0-9+/=]+)", stripped)
                     if not match:
                         issues.append(f"{key_file}:{line_no}: unrecognized key format; inspect manually")
                         continue
@@ -501,7 +523,8 @@ def audit_changes(notify=True):
         elif new is None:
             changes.append({"path": path, "change": "removed", "old": old})
         elif old.get("sha256") != new.get("sha256"):
-            changes.append({"path": path, "change": "modified", "old_sha256": old.get("sha256"), "new_sha256": new.get("sha256")})
+            changes.append({"path": path, "change": "modified",
+                            "old_sha256": old.get("sha256"), "new_sha256": new.get("sha256")})
 
     if not changes:
         log("SSH configuration audit: no content changes detected.", GREEN)
@@ -669,14 +692,55 @@ def command_apply(args):
         except Exception as rollback_exc:
             log(f"CRITICAL: rollback attempt failed: {rollback_exc}", RED)
         append_audit_log("apply_failed", {"error": str(exc), "backup": backup_name})
-        telegram_send(f"🚨 ServerGuard SSH hardening apply failed on {os.uname().nodename}. Backup: {backup_name}. Error: {exc}")
+        telegram_send(f"🚨 ServerGuard SSH hardening apply failed on {os.uname().nodename}. "
+                      f"Backup: {backup_name}. Error: {exc}")
         return 1
 
     make_baseline()
     append_audit_log("hardening_applied", {"backup": backup_name})
-    telegram_send(f"✅ ServerGuard SSH hardening applied on {os.uname().nodename}. Password authentication and SSH port were preserved. Backup: {backup_name}")
+    telegram_send(f"✅ ServerGuard SSH hardening applied on {os.uname().nodename}. "
+                  f"Password authentication and SSH port were preserved. Backup: {backup_name}")
     log(f"\nServerGuard hardening applied. Backup: {backup_name}", GREEN)
     log("PasswordAuthentication, PermitRootLogin, SSH port, and firewall rules were not changed.", CYAN)
+    return 0
+
+
+def command_disable(args):
+    if not require_root():
+        return 1
+    if not ensure_dirs():
+        return 1
+    if not HARDENING_CONFIG.exists():
+        log("ServerGuard drop-in is not installed; nothing to disable.", YELLOW)
+        return 0
+
+    backup_name = backup_configs("pre-disable")
+    if not backup_name:
+        return 1
+
+    original = HARDENING_CONFIG.read_bytes()
+    try:
+        HARDENING_CONFIG.unlink()
+        ok = validate_sshd_config() and reload_ssh()
+    except Exception as exc:
+        log(f"Disable failed: {exc}", RED)
+        ok = False
+
+    if not ok:
+        log("Disable failed; restoring ServerGuard drop-in.", RED)
+        try:
+            HARDENING_CONFIG.write_bytes(original)
+            os.chmod(HARDENING_CONFIG, 0o644)
+            validate_sshd_config()
+            reload_ssh()
+        except Exception as exc:
+            log(f"CRITICAL: could not restore drop-in: {exc}", RED)
+        return 1
+
+    make_baseline()
+    append_audit_log("hardening_disabled", {"backup": backup_name})
+    telegram_send(f"ℹ️ ServerGuard SSH hardening disabled on {os.uname().nodename}. Backup: {backup_name}")
+    log(f"ServerGuard SSH hardening disabled. Backup: {backup_name}", GREEN)
     return 0
 
 
@@ -806,6 +870,9 @@ def command_restore(args):
 
     backup_name = args.backup
     if not backup_name:
+        if not sys.stdin.isatty():
+            log("Backup name is required when not running in an interactive terminal.", RED)
+            return 1
         choices = sorted(
             (p.name for p in BACKUP_DIR.glob("pre-hardening_*.tar.gz")),
             reverse=True
@@ -905,7 +972,11 @@ def main():
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check", help="Read-only SSH hardening audit")
-    sub.add_parser("apply", help="Apply conservative SSH hardening")
+    apply_parser = sub.add_parser("apply", help="Apply conservative SSH hardening")
+    apply_parser.add_argument(
+        "--auth-method", choices=("publickey", "password"), default=None,
+        help="Accepted for ServerGuard client compatibility; does not change behavior")
+    sub.add_parser("disable", help="Remove the ServerGuard SSH drop-in")
     restore_parser = sub.add_parser("restore", help="Restore a pre-hardening backup")
     restore_parser.add_argument("backup", nargs="?", help="Backup archive filename")
     sub.add_parser("keys", help="Audit authorized_keys without changing files")
@@ -915,23 +986,19 @@ def main():
     sub.add_parser("audit-install", help="Install periodic systemd audit timer")
     args = parser.parse_args()
 
-    if args.command == "check":
-        return command_check(args)
-    if args.command == "apply":
-        return command_apply(args)
-    if args.command == "restore":
-        return command_restore(args)
-    if args.command == "keys":
-        return command_keys(args)
-    if args.command == "fail2ban":
-        return command_fail2ban(args)
-    if args.command == "fail2ban-setup":
-        return setup_fail2ban()
-    if args.command == "audit":
-        return command_audit(args)
-    if args.command == "audit-install":
-        return install_audit_timer()
-    return 2
+    handlers = {
+        "check": command_check,
+        "apply": command_apply,
+        "disable": command_disable,
+        "restore": command_restore,
+        "keys": command_keys,
+        "fail2ban": command_fail2ban,
+        "fail2ban-setup": lambda a: setup_fail2ban(),
+        "audit": command_audit,
+        "audit-install": lambda a: install_audit_timer(),
+    }
+    handler = handlers.get(args.command)
+    return handler(args) if handler else 2
 
 
 if __name__ == "__main__":
