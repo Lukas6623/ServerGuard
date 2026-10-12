@@ -3,10 +3,10 @@
 
 """
 ServerGuard Firewall Manager
-Управление портами через UFW (Ubuntu) + постоянная служба systemd.
+Port management through UFW (Ubuntu) + a persistent systemd service.
 
-Без аргументов - локальное интерактивное меню.
-Примеры:
+No arguments - local interactive menu.
+Examples:
     sudo python3 firewall_manager.py allow 8080/tcp
     sudo python3 firewall_manager.py deny 3306 --from 1.2.3.4
     sudo python3 firewall_manager.py install-service --protect 22
@@ -22,7 +22,7 @@ import sys
 import time
 
 APP_NAME = "ServerGuard Firewall Manager"
-VERSION = "2.0"
+VERSION = "2.1"
 
 INSTALL_DIR = "/opt/serverguard"
 INSTALL_PATH = INSTALL_DIR + "/firewall_manager.py"
@@ -35,10 +35,10 @@ DAEMON_INTERVAL = 30
 SPEC_RE = re.compile(r"^(\d{1,5})(?::(\d{1,5}))?(?:/(tcp|udp))?$")
 
 
-# ---------------------------------------------------------------- утилиты
+# ---------------------------------------------------------------- helpers
 
 def run_command(args, timeout=60):
-    """Запуск команды без shell. Возвращает (ok, output)."""
+    """Run a command without a shell. Returns (ok, output)."""
     try:
         r = subprocess.run(
             args,
@@ -49,7 +49,7 @@ def run_command(args, timeout=60):
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return False, "Превышено время ожидания команды."
+        return False, "Command timed out."
     except OSError as exc:
         return False, str(exc)
 
@@ -57,20 +57,20 @@ def run_command(args, timeout=60):
     err = (r.stderr or "").strip()
 
     if r.returncode != 0:
-        return False, err or out or "Команда завершилась с ошибкой."
+        return False, err or out or "Command failed."
 
     return True, out
 
 
 def require_root():
     if os.geteuid() != 0:
-        print("ОШИБКА: нужны права root (sudo).")
+        print("ERROR: root privileges required (use sudo).")
         sys.exit(1)
 
 
 def require_ufw():
     if not shutil.which("ufw"):
-        print("UFW не установлен: sudo apt update && sudo apt install ufw")
+        print("UFW is not installed: sudo apt update && sudo apt install ufw")
         sys.exit(1)
 
 
@@ -78,17 +78,17 @@ def parse_spec(text):
     """'80', '80/tcp', '8000:8100/tcp' -> (lo, hi, proto|None)"""
     m = SPEC_RE.match(text.strip().lower())
     if not m:
-        raise ValueError("Некорректный порт: %r (пример: 80, 80/tcp, 8000:8100/tcp)" % text)
+        raise ValueError("Invalid port: %r (examples: 80, 80/tcp, 8000:8100/tcp)" % text)
 
     lo = int(m.group(1))
     hi = int(m.group(2)) if m.group(2) else lo
     proto = m.group(3)
 
     if not (1 <= lo <= 65535 and 1 <= hi <= 65535) or lo > hi:
-        raise ValueError("Порт должен быть в диапазоне 1-65535 (и начало <= конец).")
+        raise ValueError("Port must be in range 1-65535 (and start <= end).")
 
     if lo != hi and proto is None:
-        raise ValueError("Для диапазона нужно указать протокол: %d:%d/tcp" % (lo, hi))
+        raise ValueError("A port range requires a protocol: %d:%d/tcp" % (lo, hi))
 
     return lo, hi, proto
 
@@ -115,7 +115,7 @@ def parse_source(text):
     try:
         return str(ipaddress.ip_network(text.strip(), strict=False))
     except ValueError:
-        raise ValueError("Некорректный IP/подсеть: %r" % text)
+        raise ValueError("Invalid IP/subnet: %r" % text)
 
 
 def build_rule(action, spec, source=None, delete=False):
@@ -134,7 +134,7 @@ def build_rule(action, spec, source=None, delete=False):
     return cmd
 
 
-# --------------------------------------------------- защищённые порты
+# ------------------------------------------------------- protected ports
 
 def detect_ssh_port():
     ok, out = run_command(["ss", "-ltnp"])
@@ -166,7 +166,7 @@ def load_protected():
 def save_protected(items):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(PROTECTED_FILE, "w") as f:
-        f.write("# Защищённые порты ServerGuard (всегда разрешены)\n")
+        f.write("# ServerGuard protected ports (always allowed)\n")
         for s in items:
             f.write(spec_to_str(s) + "\n")
     os.chmod(PROTECTED_FILE, 0o640)
@@ -182,7 +182,7 @@ def ufw_active():
 
 
 def ensure_protected():
-    """Гарантирует, что защищённые порты разрешены. Возвращает список добавленных."""
+    """Make sure protected ports are allowed. Returns the list of restored ones."""
     active, status = ufw_active()
     if not active:
         return []
@@ -199,34 +199,35 @@ def ensure_protected():
     return added
 
 
-# ---------------------------------------------------------------- команды
+# --------------------------------------------------------------- commands
 
 def cmd_status(a):
     ok, out = run_command(["ufw", "status", "verbose"])
     if not ok:
-        print("Ошибка:", out)
+        print("Error:", out)
         return 1
     print(out)
     if re.search(r"^Status:\s+inactive", out, re.I | re.M):
-        print("\nВНИМАНИЕ: UFW выключен - правила не фильтруют трафик.")
+        print("\nWARNING: UFW is disabled - rules do not filter traffic.")
+        print("Run the 'enable' command to turn the firewall on.")
     return 0
 
 
 def cmd_rules(a):
     ok, out = run_command(["ufw", "status", "numbered"])
-    print(out if ok else "Ошибка: " + out)
+    print(out if ok else "Error: " + out)
     return 0 if ok else 1
 
 
 def cmd_listening(a):
     if not shutil.which("ss"):
-        print("Команда ss не найдена.")
+        print("The 'ss' command was not found.")
         return 1
     ok, out = run_command(["ss", "-lntup"])
-    print(out if ok else "Ошибка: " + out)
+    print(out if ok else "Error: " + out)
     if ok:
-        print("\nПримечание: это прослушиваемые сокеты, а не обязательно "
-              "доступные из интернета.")
+        print("\nNote: these are listening sockets, not necessarily "
+              "reachable from the internet.")
     return 0 if ok else 1
 
 
@@ -235,25 +236,25 @@ def apply_rule(action, a, delete=False):
         spec = parse_spec(a.port)
         source = parse_source(a.source)
     except ValueError as exc:
-        print("ОШИБКА:", exc)
+        print("ERROR:", exc)
         return 2
 
     restrictive = delete and action == "allow" or action in ("deny", "reject")
     if restrictive and is_protected(spec) and not a.force:
-        print("ОТКАЗ: порт %s защищён (SSH/служба). Используй --force, "
-              "если точно уверен." % spec_to_str(spec))
+        print("REFUSED: port %s is protected (SSH/service). Use --force "
+              "if you are absolutely sure." % spec_to_str(spec))
         return 3
 
     ok, out = run_command(build_rule(action, spec, source, delete))
     if ok:
         print("[OK] %s%s %s%s" % (
-            "удалено: " if delete else "", action, spec_to_str(spec),
+            "removed: " if delete else "", action, spec_to_str(spec),
             " from " + source if source else ""))
         if out:
             print(out)
         return 0
 
-    print("[ОШИБКА]", out)
+    print("[ERROR]", out)
     return 1
 
 
@@ -281,7 +282,7 @@ def cmd_delete(a):
     text = rules.get(a.number)
 
     if text is None:
-        print("Правило №%d не найдено (см. команду rules)." % a.number)
+        print("Rule #%d not found (see the 'rules' command)." % a.number)
         return 2
 
     m = re.match(r"^(\d{1,5}(?::\d{1,5})?)(?:/(tcp|udp))?", text)
@@ -289,13 +290,13 @@ def cmd_delete(a):
         try:
             spec = parse_spec(m.group(0))
             if is_protected(spec):
-                print("ОТКАЗ: правило защищённого порта. Используй --force.")
+                print("REFUSED: this is a protected port rule. Use --force.")
                 return 3
         except ValueError:
             pass
 
     ok, out = run_command(["ufw", "--force", "delete", str(a.number)])
-    print("[OK] Правило №%d удалено." % a.number if ok else "[ОШИБКА] " + out)
+    print("[OK] Rule #%d deleted." % a.number if ok else "[ERROR] " + out)
     return 0 if ok else 1
 
 
@@ -305,40 +306,40 @@ def cmd_enable(a):
         port = detect_ssh_port()
         protected = [(port, port, "tcp")]
         save_protected(protected)
-        print("SSH-порт %d добавлен в защищённые." % port)
+        print("SSH port %d added to protected ports." % port)
 
     for spec in protected:
         run_command(build_rule("allow", spec))
 
     ok, out = run_command(["ufw", "--force", "enable"])
-    print("[OK] Firewall включён." if ok else "[ОШИБКА] " + out)
+    print("[OK] Firewall enabled." if ok else "[ERROR] " + out)
     return 0 if ok else 1
 
 
 def cmd_disable(a):
     if not a.force:
-        print("ОТКАЗ: отключение firewall требует --force.")
+        print("REFUSED: disabling the firewall requires --force.")
         return 3
     ok, out = run_command(["ufw", "disable"])
-    print("[OK] Firewall выключен." if ok else "[ОШИБКА] " + out)
+    print("[OK] Firewall disabled." if ok else "[ERROR] " + out)
     return 0 if ok else 1
 
 
 def cmd_default(a):
     ok, out = run_command(["ufw", "default", a.policy, a.direction])
-    print(out if ok else "[ОШИБКА] " + out)
+    print(out if ok else "[ERROR] " + out)
     return 0 if ok else 1
 
 
 def cmd_logging(a):
     ok, out = run_command(["ufw", "logging", a.level])
-    print(out if ok else "[ОШИБКА] " + out)
+    print(out if ok else "[ERROR] " + out)
     return 0 if ok else 1
 
 
 def cmd_reload(a):
     ok, out = run_command(["ufw", "reload"])
-    print(out if ok else "[ОШИБКА] " + out)
+    print(out if ok else "[ERROR] " + out)
     return 0 if ok else 1
 
 
@@ -347,19 +348,19 @@ def cmd_protect(a):
 
     if a.action == "list":
         if not items:
-            print("Защищённых портов нет.")
+            print("No protected ports.")
         for s in items:
             print(spec_to_str(s))
         return 0
 
     if not a.port:
-        print("Укажи порт.")
+        print("Specify a port.")
         return 2
 
     try:
         spec = parse_spec(a.port)
     except ValueError as exc:
-        print("ОШИБКА:", exc)
+        print("ERROR:", exc)
         return 2
 
     if a.action == "add":
@@ -369,11 +370,11 @@ def cmd_protect(a):
             items.append(spec)
         save_protected(items)
         run_command(build_rule("allow", spec))
-        print("[OK] Защищён: " + spec_to_str(spec))
+        print("[OK] Protected: " + spec_to_str(spec))
     else:
         items = [s for s in items if spec_to_str(s) != spec_to_str(spec)]
         save_protected(items)
-        print("[OK] Защита снята: " + spec_to_str(spec))
+        print("[OK] Protection removed: " + spec_to_str(spec))
     return 0
 
 
@@ -382,7 +383,7 @@ def cmd_version(a):
     return 0
 
 
-# ---------------------------------------------------------- служба systemd
+# ---------------------------------------------------------- systemd service
 
 UNIT = """[Unit]
 Description=ServerGuard Firewall Manager
@@ -401,7 +402,7 @@ WantedBy=multi-user.target
 
 def cmd_install_service(a):
     if not shutil.which("systemctl"):
-        print("ОШИБКА: systemctl не найден (нужен systemd).")
+        print("ERROR: systemctl not found (systemd is required).")
         return 1
 
     os.makedirs(INSTALL_DIR, exist_ok=True)
@@ -426,10 +427,10 @@ def cmd_install_service(a):
                  ["systemctl", "restart", SERVICE_NAME]):
         ok, out = run_command(args)
         if not ok:
-            print("[ОШИБКА]", " ".join(args), "->", out)
+            print("[ERROR]", " ".join(args), "->", out)
             return 1
 
-    print("[OK] Служба %s установлена и запущена." % SERVICE_NAME)
+    print("[OK] Service %s installed and started." % SERVICE_NAME)
     return 0
 
 
@@ -440,46 +441,48 @@ def cmd_uninstall_service(a):
             os.remove(path)
     run_command(["systemctl", "daemon-reload"])
     shutil.rmtree(INSTALL_DIR, ignore_errors=True)
-    print("[OK] Служба удалена. Правила UFW не изменялись.")
+    print("[OK] Service removed. UFW rules were not changed.")
     return 0
 
 
 def cmd_service_status(a):
     if not os.path.exists(INSTALL_PATH):
-        print("Не установлено.")
+        print("Not installed.")
         return 0
     _, active = run_command(["systemctl", "is-active", SERVICE_NAME])
     _, enabled = run_command(["systemctl", "is-enabled", SERVICE_NAME])
-    print("Служба: %s\nАвтозапуск: %s\nВерсия файла: %s" % (active, enabled, VERSION))
+    ufw_on, _ = ufw_active()
+    print("Service:    %s\nAutostart:  %s\nFirewall:   %s\nVersion:    %s" % (
+        active, enabled, "active" if ufw_on else "INACTIVE", VERSION))
     return 0
 
 
 def cmd_daemon(a):
-    print("%s: служба запущена (проверка каждые %d с)." % (APP_NAME, DAEMON_INTERVAL),
+    print("%s: service started (checking every %d s)." % (APP_NAME, DAEMON_INTERVAL),
           flush=True)
     while True:
         try:
             added = ensure_protected()
             if added:
-                print("Восстановлены защищённые правила: " + ", ".join(added), flush=True)
+                print("Restored protected rules: " + ", ".join(added), flush=True)
         except Exception as exc:
-            print("Ошибка цикла:", exc, flush=True)
+            print("Loop error:", exc, flush=True)
         time.sleep(DAEMON_INTERVAL)
 
 
-# ---------------------------------------------------------- локальное меню
+# ----------------------------------------------------------- local menu
 
 def interactive_menu():
     while True:
         print("=" * 46)
         print("       " + APP_NAME)
         print("=" * 46)
-        print("1. Открыть порт\n2. Закрыть порт\n3. Состояние\n"
-              "4. Правила\n5. Прослушиваемые порты\n0. Выход")
-        choice = input("Выбери действие: ").strip()
+        print("1. Open port\n2. Close port\n3. Status\n"
+              "4. Rules\n5. Listening ports\n0. Exit")
+        choice = input("Select: ").strip()
 
         if choice in ("1", "2"):
-            port = input("Порт (80, 80/tcp, 8000:8100/tcp): ").strip()
+            port = input("Port (80, 80/tcp, 8000:8100/tcp): ").strip()
             ns = argparse.Namespace(port=port, source=None, force=False)
             (cmd_allow if choice == "1" else cmd_close)(ns)
         elif choice == "3":
@@ -490,10 +493,10 @@ def interactive_menu():
             cmd_listening(None)
         elif choice == "0":
             return
-        input("\nEnter для продолжения...")
+        input("\nPress Enter to continue...")
 
 
-# ---------------------------------------------------------------- main
+# ------------------------------------------------------------------- main
 
 def build_parser():
     p = argparse.ArgumentParser(prog="firewall_manager.py", description=APP_NAME)
@@ -506,12 +509,12 @@ def build_parser():
         s.add_argument("--force", action="store_true")
         s.set_defaults(func=func)
 
-    rule_cmd("allow", cmd_allow, "открыть порт")
-    rule_cmd("deny", cmd_deny, "заблокировать порт (drop)")
-    rule_cmd("reject", cmd_reject, "заблокировать порт (с ответом)")
-    rule_cmd("limit", cmd_limit, "открыть с защитой от брутфорса")
-    rule_cmd("close", cmd_close, "удалить разрешающее правило")
-    rule_cmd("unblock", cmd_unblock, "удалить блокирующее правило")
+    rule_cmd("allow", cmd_allow, "open a port")
+    rule_cmd("deny", cmd_deny, "block a port (drop)")
+    rule_cmd("reject", cmd_reject, "block a port (with reply)")
+    rule_cmd("limit", cmd_limit, "open with brute-force protection")
+    rule_cmd("close", cmd_close, "remove an allow rule")
+    rule_cmd("unblock", cmd_unblock, "remove a deny rule")
 
     for name, func in (("status", cmd_status), ("rules", cmd_rules),
                        ("listening", cmd_listening), ("enable", cmd_enable),
@@ -572,4 +575,4 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("\nРабота завершена.")
+        print("\nStopped.")
