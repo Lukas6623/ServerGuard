@@ -1,0 +1,11 @@
+{
+    "format":  "ServerGuardModuleManifest",
+    "version":  1,
+    "algorithm":  "Ed25519",
+    "files":  [
+                  {
+                      "path":  "ssh_hardening.py",
+                      "sha256":  "906e332a7394b3cc59d78af3b868f43e3b3503649226a5057e7c4d0352c49bc4"
+                  }
+              ]
+}
