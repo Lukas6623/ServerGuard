@@ -1,0 +1,11 @@
+{
+    "format":  "ServerGuardModuleManifest",
+    "version":  1,
+    "algorithm":  "Ed25519",
+    "files":  [
+                  {
+                      "path":  "firewall_manager.py",
+                      "sha256":  "0295f1baccd5196bdbe52f03b2385fbf3d4088b2bd69e8d514db0ce3bdcafe87"
+                  }
+              ]
+}
