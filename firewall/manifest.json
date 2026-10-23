@@ -1,1 +1,1 @@
-{"format":"ServerGuardModuleManifest","version":1,"module_version":"1.1.0","algorithm":"Ed25519","files":[{"path":"firewall_manager.py","sha256":"3c8ee1b83349033ea002218408b9cc78a5ed598d6be1a1f17b70f51b5607f5c0"}]}
+{"format":"ServerGuardModuleManifest","version":1,"module_version":"1.1.0","algorithm":"Ed25519","files":[{"path":"firewall_manager.py","sha256":"b2f897dacb25f9a11eb19f154688c6ecd81d4c32673544121b06f9b992804fc3"}]}
