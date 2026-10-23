@@ -1,9 +1,12 @@
-
 #!/usr/bin/env python3
 
 import ipaddress
 import json
+import os
+import re
+import select
 import subprocess
+import tempfile
 import time
 
 from datetime import datetime, timezone
@@ -48,14 +51,13 @@ def ensure_directories():
 
 def run_command(command, timeout=COMMAND_TIMEOUT):
     try:
-        result = subprocess.run(
+        return subprocess.run(
             command,
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
         )
-        return result
     except (OSError, subprocess.SubprocessError) as exc:
         log(f"Command error ({command[0]}): {exc}")
         return None
@@ -73,16 +75,28 @@ def load_json(path, default):
 
 
 def save_json(path, data):
-    temporary_path = path.with_suffix(".tmp")
+    temporary_path = None
+    fd = None
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        with temporary_path.open("w", encoding="utf-8") as file:
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        temporary_path = Path(temporary_name)
+
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            fd = None
             json.dump(data, file, indent=2, ensure_ascii=False)
             file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
 
         temporary_path.replace(path)
+        temporary_path = None
 
         try:
             path.chmod(0o600)
@@ -93,13 +107,20 @@ def save_json(path, data):
 
     except (OSError, TypeError, ValueError) as exc:
         log(f"Cannot save {path}: {exc}")
-
-        try:
-            temporary_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
         return False
+
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def as_bool(value, default=False):
@@ -158,7 +179,10 @@ def load_protection_config():
     if isinstance(whitelist, list):
         for entry in whitelist:
             try:
-                network = ipaddress.ip_network(str(entry).strip(), strict=False)
+                network = ipaddress.ip_network(
+                    str(entry).strip(),
+                    strict=False,
+                )
                 normalized = str(network)
 
                 if normalized not in clean_whitelist:
@@ -386,7 +410,10 @@ def block_ip(ip, failed_attempts, config):
     update_stat("blocked")
 
     if config["permanent"]:
-        log(f"{address} blocked permanently after {failed_attempts} failed attempts")
+        log(
+            f"{address} blocked permanently after "
+            f"{failed_attempts} failed attempts"
+        )
     else:
         log(f"{address} blocked for {config['duration']} seconds")
 
@@ -475,27 +502,27 @@ def cleanup_attempts():
 FAILED_PATTERNS = (
     (
         "failed_password",
-        __import__("re").compile(
+        re.compile(
             r"Failed password for (?:invalid user )?(\S+) from ([0-9a-fA-F:.]+)"
         ),
     ),
     (
         "failed_publickey",
-        __import__("re").compile(
+        re.compile(
             r"Failed publickey for (?:invalid user )?(\S+) from ([0-9a-fA-F:.]+)"
         ),
     ),
     (
         "invalid_user",
-        __import__("re").compile(
+        re.compile(
             r"Invalid user (\S+) from ([0-9a-fA-F:.]+)"
         ),
     ),
     (
         "authentication_failure",
-        __import__("re").compile(
+        re.compile(
             r"authentication failure.*rhost=([0-9a-fA-F:.]+)",
-            __import__("re").IGNORECASE,
+            re.IGNORECASE,
         ),
     ),
 )
@@ -503,19 +530,19 @@ FAILED_PATTERNS = (
 SUCCESS_PATTERNS = (
     (
         "password",
-        __import__("re").compile(
+        re.compile(
             r"Accepted password for (\S+) from ([0-9a-fA-F:.]+)"
         ),
     ),
     (
         "publickey",
-        __import__("re").compile(
+        re.compile(
             r"Accepted publickey for (\S+) from ([0-9a-fA-F:.]+)"
         ),
     ),
     (
         "keyboard-interactive",
-        __import__("re").compile(
+        re.compile(
             r"Accepted keyboard-interactive/pam for (\S+) from ([0-9a-fA-F:.]+)"
         ),
     ),
@@ -653,29 +680,56 @@ def run_journal():
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
+                text=False,
+                bufsize=0,
             )
 
             if process.stdout is None:
                 raise RuntimeError("Could not open journal output")
 
+            pending = b""
+
             while True:
-                line = process.stdout.readline()
+                readable, _, _ = select.select(
+                    [process.stdout], [], [], 0.5
+                )
 
-                if line:
-                    process_line(line)
-                    continue
+                if readable:
+                    chunk = os.read(process.stdout.fileno(), 4096)
 
-                if process.poll() is not None:
-                    error = ""
+                    if chunk:
+                        pending += chunk
 
-                    if process.stderr:
-                        error = process.stderr.read().strip()
+                        while b"\n" in pending:
+                            raw_line, pending = pending.split(b"\n", 1)
 
-                    if error:
-                        log(f"journalctl: {error}")
+                            if raw_line:
+                                process_line(
+                                    raw_line.decode(
+                                        "utf-8",
+                                        errors="replace",
+                                    )
+                                )
+                    else:
+                        if pending:
+                            process_line(
+                                pending.decode(
+                                    "utf-8",
+                                    errors="replace",
+                                )
+                            )
+                            pending = b""
+                        break
 
+                if process.poll() is not None and not readable:
+                    if pending:
+                        process_line(
+                            pending.decode(
+                                "utf-8",
+                                errors="replace",
+                            )
+                        )
+                        pending = b""
                     break
 
                 now = time.time()
@@ -686,12 +740,24 @@ def run_journal():
                     cleanup_attempts()
                     run_journal.last_cleanup = now
 
-                time.sleep(0.2)
+            if process.poll() is not None and process.stderr:
+                error = process.stderr.read().decode(
+                    "utf-8",
+                    errors="replace",
+                ).strip()
+
+                if error:
+                    log(f"journalctl: {error}")
 
         except KeyboardInterrupt:
             raise
 
-        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        except (
+            OSError,
+            RuntimeError,
+            subprocess.SubprocessError,
+            ValueError,
+        ) as exc:
             log(f"Journal error: {exc}")
 
         finally:
@@ -702,6 +768,7 @@ def run_journal():
                     process.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     process.kill()
+                    process.wait()
 
         log("SSH journal stopped. Restarting in 3 seconds...")
         time.sleep(3)
