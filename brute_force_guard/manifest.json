@@ -1,6 +1,6 @@
 {
     "format": "ServerGuardModuleManifest",
-    "version": 1,
+    "version": 2,
     "algorithm": "Ed25519",
     "files": [
         {
