@@ -1,0 +1,11 @@
+{
+    "format": "ServerGuardModuleManifest",
+    "version": 1,
+    "algorithm": "Ed25519",
+    "files": [
+        {
+            "path": "brute_force_guard.py",
+            "sha256": "c4bea4f5e8aac0d573b81f8b4090ba1f7eff2d92970297a15aaf1b96a70f2dc8"
+        }
+    ]
+}
