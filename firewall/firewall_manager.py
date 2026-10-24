@@ -1,578 +1,477 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
+#!/usr/bin/env python3
 """
 ServerGuard Firewall Manager
-Port management through UFW (Ubuntu) + a persistent systemd service.
-
-No arguments - local interactive menu.
-Examples:
-    sudo python3 firewall_manager.py allow 8080/tcp
-    sudo python3 firewall_manager.py deny 3306 --from 1.2.3.4
-    sudo python3 firewall_manager.py install-service --protect 22
+CLI utility for managing UFW. It is not a systemd daemon.
 """
 
 import argparse
 import ipaddress
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import time
+from pathlib import Path
 
 APP_NAME = "ServerGuard Firewall Manager"
-VERSION = "2.1"
+VERSION = "3.1.0"
 
-INSTALL_DIR = "/opt/serverguard"
-INSTALL_PATH = INSTALL_DIR + "/firewall_manager.py"
-SERVICE_NAME = "serverguard-firewall"
-SERVICE_PATH = "/etc/systemd/system/%s.service" % SERVICE_NAME
-CONFIG_DIR = "/etc/serverguard"
-PROTECTED_FILE = CONFIG_DIR + "/protected_ports"
-DAEMON_INTERVAL = 30
-
-SPEC_RE = re.compile(r"^(\d{1,5})(?::(\d{1,5}))?(?:/(tcp|udp))?$")
+UFW = shutil.which("ufw") or "/usr/sbin/ufw"
+SSH_CONFIG = Path("/etc/ssh/sshd_config")
+MODULE_PATH = Path("/opt/serverguard/firewall_manager.py")
+PROTECTED_FILE = Path("/etc/serverguard/firewall_protected_ports.json")
 
 
-# ---------------------------------------------------------------- helpers
-
-def run_command(args, timeout=60):
-    """Run a command without a shell. Returns (ok, output)."""
+def run_command(args, check=False):
     try:
-        r = subprocess.run(
+        result = subprocess.run(
             args,
+            text=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            timeout=timeout,
+            stderr=subprocess.STDOUT,
             check=False,
+            timeout=60,
         )
-    except subprocess.TimeoutExpired:
-        return False, "Command timed out."
-    except OSError as exc:
-        return False, str(exc)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"ERROR: {exc}")
+        raise SystemExit(1)
 
-    out = (r.stdout or "").strip()
-    err = (r.stderr or "").strip()
+    if check and result.returncode != 0:
+        print(result.stdout)
+        raise SystemExit(result.returncode)
 
-    if r.returncode != 0:
-        return False, err or out or "Command failed."
-
-    return True, out
+    return result
 
 
 def require_root():
     if os.geteuid() != 0:
-        print("ERROR: root privileges required (use sudo).")
-        sys.exit(1)
+        print("ERROR: run this command with sudo.")
+        raise SystemExit(1)
 
 
 def require_ufw():
-    if not shutil.which("ufw"):
-        print("UFW is not installed: sudo apt update && sudo apt install ufw")
-        sys.exit(1)
+    if not shutil.which("ufw") and not Path(UFW).is_file():
+        print("ERROR: ufw is not installed.")
+        print("Install it with: sudo apt install ufw")
+        raise SystemExit(1)
 
 
-def parse_spec(text):
-    """'80', '80/tcp', '8000:8100/tcp' -> (lo, hi, proto|None)"""
-    m = SPEC_RE.match(text.strip().lower())
-    if not m:
-        raise ValueError("Invalid port: %r (examples: 80, 80/tcp, 8000:8100/tcp)" % text)
-
-    lo = int(m.group(1))
-    hi = int(m.group(2)) if m.group(2) else lo
-    proto = m.group(3)
-
-    if not (1 <= lo <= 65535 and 1 <= hi <= 65535) or lo > hi:
-        raise ValueError("Port must be in range 1-65535 (and start <= end).")
-
-    if lo != hi and proto is None:
-        raise ValueError("A port range requires a protocol: %d:%d/tcp" % (lo, hi))
-
-    return lo, hi, proto
+def ufw(args, check=True):
+    require_ufw()
+    return run_command([UFW, *args], check=check)
 
 
-def spec_ports(spec):
-    lo, hi, _ = spec
-    return str(lo) if lo == hi else "%d:%d" % (lo, hi)
+def valid_port_spec(value):
+    match = re.fullmatch(
+        r"(\d{1,5})(?::(\d{1,5}))?(?:/(tcp|udp))?",
+        value.lower(),
+    )
+    if not match:
+        raise argparse.ArgumentTypeError(
+            "Use PORT, PORT/tcp, PORT/udp or START:END/tcp."
+        )
+
+    start = int(match.group(1))
+    end = int(match.group(2) or start)
+    proto = match.group(3)
+
+    if not (1 <= start <= 65535 and 1 <= end <= 65535):
+        raise argparse.ArgumentTypeError("Ports must be between 1 and 65535.")
+
+    if end < start:
+        raise argparse.ArgumentTypeError("Range end must be >= range start.")
+
+    if end != start and not proto:
+        raise argparse.ArgumentTypeError(
+            "Port ranges must specify /tcp or /udp."
+        )
+
+    if end - start > 2000:
+        raise argparse.ArgumentTypeError("Port range is too large.")
+
+    return value.lower()
 
 
-def spec_to_str(spec):
-    ports = spec_ports(spec)
-    return ports + ("/" + spec[2] if spec[2] else "")
+def valid_source(value):
+    if value.lower() == "any":
+        return "any"
 
-
-def overlaps(a, b):
-    if a[2] and b[2] and a[2] != b[2]:
-        return False
-    return a[0] <= b[1] and b[0] <= a[1]
-
-
-def parse_source(text):
-    if not text:
-        return None
     try:
-        return str(ipaddress.ip_network(text.strip(), strict=False))
+        return str(ipaddress.ip_network(value, strict=False))
     except ValueError:
-        raise ValueError("Invalid IP/subnet: %r" % text)
+        raise argparse.ArgumentTypeError("Invalid IP address or CIDR.")
 
 
-def build_rule(action, spec, source=None, delete=False):
-    cmd = ["ufw"]
-    if delete:
-        cmd += ["--force", "delete"]
-    cmd.append(action)
+def ssh_ports():
+    ports = {22}
 
-    if source:
-        cmd += ["from", source, "to", "any", "port", spec_ports(spec)]
-        if spec[2]:
-            cmd += ["proto", spec[2]]
-    else:
-        cmd.append(spec_to_str(spec))
+    try:
+        text = SSH_CONFIG.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            match = re.match(r"(?i)^Port\s+(\d+)\s*$", line)
+            if match:
+                port = int(match.group(1))
+                if 1 <= port <= 65535:
+                    ports.add(port)
+    except OSError:
+        pass
 
-    return cmd
+    return ports
 
 
-# ------------------------------------------------------- protected ports
+def parse_port_number(spec):
+    match = re.match(r"^(\d+)(?:/(\w+))?$", spec)
+    if not match:
+        return None, None
 
-def detect_ssh_port():
-    ok, out = run_command(["ss", "-ltnp"])
-    if ok:
-        for line in out.splitlines():
-            if "sshd" in line:
-                m = re.search(r":(\d+)\s", line)
-                if m:
-                    return int(m.group(1))
-    return 22
+    return int(match.group(1)), (match.group(2) or "").lower()
 
 
 def load_protected():
-    result = []
     try:
-        with open(PROTECTED_FILE, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    try:
-                        result.append(parse_spec(line))
-                    except ValueError:
-                        pass
-    except OSError:
+        data = json.loads(PROTECTED_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return set(str(x).lower() for x in data)
+    except (OSError, json.JSONDecodeError):
         pass
-    return result
+
+    return set()
 
 
-def save_protected(items):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(PROTECTED_FILE, "w") as f:
-        f.write("# ServerGuard protected ports (always allowed)\n")
-        for s in items:
-            f.write(spec_to_str(s) + "\n")
-    os.chmod(PROTECTED_FILE, 0o640)
+def save_protected(values):
+    require_root()
+    PROTECTED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = PROTECTED_FILE.with_suffix(".tmp")
+    temp.write_text(
+        json.dumps(sorted(values), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(temp, 0o600)
+    os.replace(temp, PROTECTED_FILE)
 
 
-def is_protected(spec):
-    return any(overlaps(spec, p) for p in load_protected())
-
-
-def ufw_active():
-    ok, out = run_command(["ufw", "status"])
-    return ok and re.search(r"^Status:\s+active", out, re.I | re.M) is not None, out
-
-
-def ensure_protected():
-    """Make sure protected ports are allowed. Returns the list of restored ones."""
-    active, status = ufw_active()
-    if not active:
-        return []
-
-    added = []
-    for spec in load_protected():
-        ports = spec_ports(spec)
-        pattern = r"^%s(/%s)?(\s+\(v6\))?\s+ALLOW" % (
-            re.escape(ports), spec[2] or "(tcp|udp)")
-        if not re.search(pattern, status, re.M):
-            ok, _ = run_command(build_rule("allow", spec))
-            if ok:
-                added.append(spec_to_str(spec))
-    return added
-
-
-# --------------------------------------------------------------- commands
-
-def cmd_status(a):
-    ok, out = run_command(["ufw", "status", "verbose"])
-    if not ok:
-        print("Error:", out)
-        return 1
-    print(out)
-    if re.search(r"^Status:\s+inactive", out, re.I | re.M):
-        print("\nWARNING: UFW is disabled - rules do not filter traffic.")
-        print("Run the 'enable' command to turn the firewall on.")
-    return 0
-
-
-def cmd_rules(a):
-    ok, out = run_command(["ufw", "status", "numbered"])
-    print(out if ok else "Error: " + out)
-    return 0 if ok else 1
-
-
-def cmd_listening(a):
-    if not shutil.which("ss"):
-        print("The 'ss' command was not found.")
-        return 1
-    ok, out = run_command(["ss", "-lntup"])
-    print(out if ok else "Error: " + out)
-    if ok:
-        print("\nNote: these are listening sockets, not necessarily "
-              "reachable from the internet.")
-    return 0 if ok else 1
-
-
-def apply_rule(action, a, delete=False):
-    try:
-        spec = parse_spec(a.port)
-        source = parse_source(a.source)
-    except ValueError as exc:
-        print("ERROR:", exc)
-        return 2
-
-    restrictive = delete and action == "allow" or action in ("deny", "reject")
-    if restrictive and is_protected(spec) and not a.force:
-        print("REFUSED: port %s is protected (SSH/service). Use --force "
-              "if you are absolutely sure." % spec_to_str(spec))
-        return 3
-
-    ok, out = run_command(build_rule(action, spec, source, delete))
-    if ok:
-        print("[OK] %s%s %s%s" % (
-            "removed: " if delete else "", action, spec_to_str(spec),
-            " from " + source if source else ""))
-        if out:
-            print(out)
-        return 0
-
-    print("[ERROR]", out)
-    return 1
-
-
-def cmd_allow(a):   return apply_rule("allow", a)
-def cmd_deny(a):    return apply_rule("deny", a)
-def cmd_reject(a):  return apply_rule("reject", a)
-def cmd_limit(a):   return apply_rule("limit", a)
-def cmd_close(a):   return apply_rule("allow", a, delete=True)
-def cmd_unblock(a): return apply_rule("deny", a, delete=True)
-
-
-def get_numbered():
-    ok, out = run_command(["ufw", "status", "numbered"])
-    rules = []
-    if ok:
-        for line in out.splitlines():
-            m = re.match(r"^\[\s*(\d+)\]\s+(.*)$", line)
-            if m:
-                rules.append((int(m.group(1)), m.group(2)))
-    return rules
-
-
-def cmd_delete(a):
-    rules = dict(get_numbered())
-    text = rules.get(a.number)
-
-    if text is None:
-        print("Rule #%d not found (see the 'rules' command)." % a.number)
-        return 2
-
-    m = re.match(r"^(\d{1,5}(?::\d{1,5})?)(?:/(tcp|udp))?", text)
-    if m and "ALLOW" in text and not a.force:
-        try:
-            spec = parse_spec(m.group(0))
-            if is_protected(spec):
-                print("REFUSED: this is a protected port rule. Use --force.")
-                return 3
-        except ValueError:
-            pass
-
-    ok, out = run_command(["ufw", "--force", "delete", str(a.number)])
-    print("[OK] Rule #%d deleted." % a.number if ok else "[ERROR] " + out)
-    return 0 if ok else 1
-
-
-def cmd_enable(a):
+def protected_match(spec):
     protected = load_protected()
-    if not protected:
-        port = detect_ssh_port()
-        protected = [(port, port, "tcp")]
-        save_protected(protected)
-        print("SSH port %d added to protected ports." % port)
+    protected.update(f"{p}/tcp" for p in ssh_ports())
 
-    for spec in protected:
-        run_command(build_rule("allow", spec))
+    port, proto = parse_port_number(spec)
+    if port is None:
+        return False
 
-    ok, out = run_command(["ufw", "--force", "enable"])
-    print("[OK] Firewall enabled." if ok else "[ERROR] " + out)
-    return 0 if ok else 1
+    for item in protected:
+        pnum, pproto = parse_port_number(item)
+        if pnum == port and (not pproto or not proto or pproto == proto):
+            return True
 
-
-def cmd_disable(a):
-    if not a.force:
-        print("REFUSED: disabling the firewall requires --force.")
-        return 3
-    ok, out = run_command(["ufw", "disable"])
-    print("[OK] Firewall disabled." if ok else "[ERROR] " + out)
-    return 0 if ok else 1
+    return False
 
 
-def cmd_default(a):
-    ok, out = run_command(["ufw", "default", a.policy, a.direction])
-    print(out if ok else "[ERROR] " + out)
-    return 0 if ok else 1
+def guard_protected(spec, force):
+    if protected_match(spec) and not force:
+        print(
+            f"REFUSED: {spec} is protected (including configured SSH ports)."
+        )
+        print("If you understand the risk, repeat with --force.")
+        raise SystemExit(3)
 
 
-def cmd_logging(a):
-    ok, out = run_command(["ufw", "logging", a.level])
-    print(out if ok else "[ERROR] " + out)
-    return 0 if ok else 1
+def cmd_version(_):
+    print(f"{APP_NAME} {VERSION}")
 
 
-def cmd_reload(a):
-    ok, out = run_command(["ufw", "reload"])
-    print(out if ok else "[ERROR] " + out)
-    return 0 if ok else 1
+def cmd_status(_):
+    result = ufw(["status", "verbose"], check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
 
 
-def cmd_protect(a):
-    items = load_protected()
-
-    if a.action == "list":
-        if not items:
-            print("No protected ports.")
-        for s in items:
-            print(spec_to_str(s))
-        return 0
-
-    if not a.port:
-        print("Specify a port.")
-        return 2
-
-    try:
-        spec = parse_spec(a.port)
-    except ValueError as exc:
-        print("ERROR:", exc)
-        return 2
-
-    if a.action == "add":
-        if spec[2] is None:
-            spec = (spec[0], spec[1], "tcp")
-        if spec_to_str(spec) not in [spec_to_str(s) for s in items]:
-            items.append(spec)
-        save_protected(items)
-        run_command(build_rule("allow", spec))
-        print("[OK] Protected: " + spec_to_str(spec))
-    else:
-        items = [s for s in items if spec_to_str(s) != spec_to_str(spec)]
-        save_protected(items)
-        print("[OK] Protection removed: " + spec_to_str(spec))
-    return 0
+def cmd_rules(_):
+    result = ufw(["status", "numbered"], check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
 
 
-def cmd_version(a):
-    print("%s %s" % (APP_NAME, VERSION))
-    return 0
+def cmd_listening(_):
+    command = shutil.which("ss")
+    if not command:
+        print("ERROR: ss is not installed (package: iproute2).")
+        raise SystemExit(1)
+
+    result = run_command([command, "-lntup"], check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
 
 
-# ---------------------------------------------------------- systemd service
-
-UNIT = """[Unit]
-Description=ServerGuard Firewall Manager
-After=network.target ufw.service
-
-[Service]
-Type=simple
-ExecStart={python} {path} daemon
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"""
-
-
-def cmd_install_service(a):
-    if not shutil.which("systemctl"):
-        print("ERROR: systemctl not found (systemd is required).")
-        return 1
-
-    os.makedirs(INSTALL_DIR, exist_ok=True)
-
-    src = os.path.abspath(__file__)
-    if src != INSTALL_PATH:
-        shutil.copy2(src, INSTALL_PATH)
-    os.chmod(INSTALL_PATH, 0o750)
-
-    for p in a.protect or []:
-        cmd_protect(argparse.Namespace(action="add", port=str(p)))
-
-    if not load_protected():
-        cmd_protect(argparse.Namespace(action="add", port=str(detect_ssh_port())))
-
-    python = sys.executable or "/usr/bin/python3"
-    with open(SERVICE_PATH, "w") as f:
-        f.write(UNIT.format(python=python, path=INSTALL_PATH))
-
-    for args in (["systemctl", "daemon-reload"],
-                 ["systemctl", "enable", SERVICE_NAME],
-                 ["systemctl", "restart", SERVICE_NAME]):
-        ok, out = run_command(args)
-        if not ok:
-            print("[ERROR]", " ".join(args), "->", out)
-            return 1
-
-    print("[OK] Service %s installed and started." % SERVICE_NAME)
-    return 0
-
-
-def cmd_uninstall_service(a):
-    run_command(["systemctl", "disable", "--now", SERVICE_NAME])
-    for path in (SERVICE_PATH,):
-        if os.path.exists(path):
-            os.remove(path)
-    run_command(["systemctl", "daemon-reload"])
-    shutil.rmtree(INSTALL_DIR, ignore_errors=True)
-    print("[OK] Service removed. UFW rules were not changed.")
-    return 0
-
-
-def cmd_service_status(a):
-    if not os.path.exists(INSTALL_PATH):
-        print("Not installed.")
-        return 0
-    _, active = run_command(["systemctl", "is-active", SERVICE_NAME])
-    _, enabled = run_command(["systemctl", "is-enabled", SERVICE_NAME])
-    ufw_on, _ = ufw_active()
-    print("Service:    %s\nAutostart:  %s\nFirewall:   %s\nVersion:    %s" % (
-        active, enabled, "active" if ufw_on else "INACTIVE", VERSION))
-    return 0
-
-
-def cmd_daemon(a):
-    print("%s: service started (checking every %d s)." % (APP_NAME, DAEMON_INTERVAL),
-          flush=True)
-    while True:
-        try:
-            added = ensure_protected()
-            if added:
-                print("Restored protected rules: " + ", ".join(added), flush=True)
-        except Exception as exc:
-            print("Loop error:", exc, flush=True)
-        time.sleep(DAEMON_INTERVAL)
-
-
-# ----------------------------------------------------------- local menu
-
-def interactive_menu():
-    while True:
-        print("=" * 46)
-        print("       " + APP_NAME)
-        print("=" * 46)
-        print("1. Open port\n2. Close port\n3. Status\n"
-              "4. Rules\n5. Listening ports\n0. Exit")
-        choice = input("Select: ").strip()
-
-        if choice in ("1", "2"):
-            port = input("Port (80, 80/tcp, 8000:8100/tcp): ").strip()
-            ns = argparse.Namespace(port=port, source=None, force=False)
-            (cmd_allow if choice == "1" else cmd_close)(ns)
-        elif choice == "3":
-            cmd_status(None)
-        elif choice == "4":
-            cmd_rules(None)
-        elif choice == "5":
-            cmd_listening(None)
-        elif choice == "0":
-            return
-        input("\nPress Enter to continue...")
-
-
-# ------------------------------------------------------------------- main
-
-def build_parser():
-    p = argparse.ArgumentParser(prog="firewall_manager.py", description=APP_NAME)
-    sub = p.add_subparsers(dest="cmd")
-
-    def rule_cmd(name, func, help_):
-        s = sub.add_parser(name, help=help_)
-        s.add_argument("port")
-        s.add_argument("--from", dest="source", default=None)
-        s.add_argument("--force", action="store_true")
-        s.set_defaults(func=func)
-
-    rule_cmd("allow", cmd_allow, "open a port")
-    rule_cmd("deny", cmd_deny, "block a port (drop)")
-    rule_cmd("reject", cmd_reject, "block a port (with reply)")
-    rule_cmd("limit", cmd_limit, "open with brute-force protection")
-    rule_cmd("close", cmd_close, "remove an allow rule")
-    rule_cmd("unblock", cmd_unblock, "remove a deny rule")
-
-    for name, func in (("status", cmd_status), ("rules", cmd_rules),
-                       ("listening", cmd_listening), ("enable", cmd_enable),
-                       ("reload", cmd_reload), ("version", cmd_version),
-                       ("daemon", cmd_daemon),
-                       ("uninstall-service", cmd_uninstall_service),
-                       ("service-status", cmd_service_status)):
-        sub.add_parser(name).set_defaults(func=func)
-
-    s = sub.add_parser("disable")
-    s.add_argument("--force", action="store_true")
-    s.set_defaults(func=cmd_disable)
-
-    s = sub.add_parser("delete")
-    s.add_argument("number", type=int)
-    s.add_argument("--force", action="store_true")
-    s.set_defaults(func=cmd_delete)
-
-    s = sub.add_parser("default")
-    s.add_argument("direction", choices=("incoming", "outgoing", "routed"))
-    s.add_argument("policy", choices=("allow", "deny", "reject"))
-    s.set_defaults(func=cmd_default)
-
-    s = sub.add_parser("logging")
-    s.add_argument("level", choices=("on", "off", "low", "medium", "high", "full"))
-    s.set_defaults(func=cmd_logging)
-
-    s = sub.add_parser("protect")
-    s.add_argument("action", choices=("list", "add", "remove"))
-    s.add_argument("port", nargs="?")
-    s.set_defaults(func=cmd_protect)
-
-    s = sub.add_parser("install-service")
-    s.add_argument("--protect", action="append", type=int)
-    s.set_defaults(func=cmd_install_service)
-
-    return p
-
-
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if args.cmd == "version":
-        return cmd_version(args)
-
+def cmd_allow(args):
     require_root()
     require_ufw()
 
-    if not args.cmd:
-        interactive_menu()
-        return 0
+    if args.from_ip:
+        source = args.from_ip
+        cmd = ["allow", "from", source, "to", "any", "port", args.port]
+    else:
+        cmd = ["allow", args.port]
 
-    return args.func(args)
+    result = ufw(cmd, check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
+
+def cmd_close(args):
+    require_root()
+    guard_protected(args.port, args.force)
+
+    command = ["delete", "allow"]
+    if args.from_ip:
+        command += ["from", args.from_ip, "to", "any", "port", args.port]
+    else:
+        command.append(args.port)
+
+    result = ufw(command, check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
+
+def cmd_deny(args):
+    require_root()
+    guard_protected(args.port, args.force)
+
+    command = ["deny"]
+    if args.from_ip:
+        command += ["from", args.from_ip, "to", "any", "port", args.port]
+    else:
+        command.append(args.port)
+
+    result = ufw(command, check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
+
+def cmd_unblock(args):
+    require_root()
+    guard_protected(args.port, args.force)
+
+    command = ["delete", "deny"]
+    if args.from_ip:
+        command += ["from", args.from_ip, "to", "any", "port", args.port]
+    else:
+        command.append(args.port)
+
+    result = ufw(command, check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
+
+def cmd_limit(args):
+    require_root()
+    guard_protected(args.port, args.force)
+
+    command = ["limit"]
+    if args.from_ip:
+        command += ["from", args.from_ip, "to", "any", "port", args.port]
+    else:
+        command.append(args.port)
+
+    result = ufw(command, check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
+
+def cmd_enable(_):
+    require_root()
+    result = ufw(["--force", "enable"], check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
+
+def cmd_disable(args):
+    require_root()
+    if not args.force:
+        print("Refusing to disable UFW without --force.")
+        raise SystemExit(2)
+
+    result = ufw(["--force", "disable"], check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
+
+def cmd_reload(_):
+    require_root()
+    result = ufw(["reload"], check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
+
+def cmd_init(args):
+    require_root()
+    require_ufw()
+
+    # Add the current SSH port before enabling UFW to reduce lockout risk.
+    ssh_port = args.ssh_port
+    result = ufw(["allow", f"{ssh_port}/tcp"], check=False)
+    print(result.stdout, end="")
+
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
+    result = ufw(["--force", "enable"], check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
+    print(f"UFW initialized. SSH TCP port {ssh_port} was allowed.")
+
+
+def cmd_delete(args):
+    require_root()
+
+    if not args.number.isdigit() or int(args.number) < 1:
+        print("ERROR: rule number must be a positive integer.")
+        raise SystemExit(2)
+
+    result = ufw(["--force", "delete", args.number], check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
+
+def cmd_default(args):
+    require_root()
+
+    directions = {
+        "incoming": "incoming",
+        "outgoing": "outgoing",
+        "routed": "routed",
+    }
+    policies = {"allow", "deny", "reject"}
+
+    if args.direction not in directions or args.policy not in policies:
+        print("ERROR: invalid direction or policy.")
+        raise SystemExit(2)
+
+    result = ufw(["default", args.policy, directions[args.direction]], check=False)
+    print(result.stdout, end="")
+    if result.returncode:
+        raise SystemExit(result.returncode)
+
+
+def cmd_protect(args):
+    require_root()
+    values = load_protected()
+
+    if args.protect_action == "list":
+        values.update(f"{p}/tcp" for p in ssh_ports())
+        print("Protected ports:")
+        for item in sorted(values):
+            print(f"  {item}")
+        return
+
+    if not args.port:
+        print("ERROR: specify a port such as 22/tcp.")
+        raise SystemExit(2)
+
+    if args.protect_action == "add":
+        values.add(args.port.lower())
+        save_protected(values)
+        print(f"Protected port added: {args.port}")
+    elif args.protect_action == "remove":
+        # The SSH port is always protected automatically.
+        port, proto = parse_port_number(args.port)
+        if port in ssh_ports():
+            print("ERROR: configured SSH ports cannot be removed from protection.")
+            raise SystemExit(2)
+        values.discard(args.port.lower())
+        save_protected(values)
+        print(f"Protected port removed: {args.port}")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=APP_NAME)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("version")
+    p.set_defaults(func=cmd_version)
+
+    p = sub.add_parser("status")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("rules")
+    p.set_defaults(func=cmd_rules)
+
+    p = sub.add_parser("listening")
+    p.set_defaults(func=cmd_listening)
+
+    p = sub.add_parser("allow")
+    p.add_argument("port", type=valid_port_spec)
+    p.add_argument("--from", dest="from_ip", type=valid_source)
+    p.set_defaults(func=cmd_allow)
+
+    for name, func in (
+        ("close", cmd_close),
+        ("deny", cmd_deny),
+        ("unblock", cmd_unblock),
+        ("limit", cmd_limit),
+    ):
+        p = sub.add_parser(name)
+        p.add_argument("port", type=valid_port_spec)
+        p.add_argument("--from", dest="from_ip", type=valid_source)
+        p.add_argument("--force", action="store_true")
+        p.set_defaults(func=func)
+
+    p = sub.add_parser("enable")
+    p.set_defaults(func=cmd_enable)
+
+    p = sub.add_parser("disable")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_disable)
+
+    p = sub.add_parser("reload")
+    p.set_defaults(func=cmd_reload)
+
+    p = sub.add_parser("init")
+    p.add_argument("--ssh-port", type=int, default=22)
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("delete")
+    p.add_argument("number")
+    p.set_defaults(func=cmd_delete)
+
+    p = sub.add_parser("default")
+    p.add_argument("direction", choices=("incoming", "outgoing", "routed"))
+    p.add_argument("policy", choices=("allow", "deny", "reject"))
+    p.set_defaults(func=cmd_default)
+
+    p = sub.add_parser("protect")
+    protect_sub = p.add_subparsers(dest="protect_action", required=True)
+
+    protect_sub.add_parser("list")
+    for action in ("add", "remove"):
+        sp = protect_sub.add_parser(action)
+        sp.add_argument("port", type=valid_port_spec)
+
+    p.set_defaults(func=cmd_protect)
+
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    args.func(args)
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        print("\nStopped.")
+    main()
