@@ -1,7 +1,7 @@
 {
-    "version": "1.1.14",
-    "url": "https://github.com/Lukas6623/ServerGuard/releases/download/v1.1.14/ServerGuard-v1.1.14.zip",
-    "sha256": "39A295EB8E26FED907B80883371DEA65F5C22950B069DC5CE252C22E6300DCE7",
+    "version": "1.1.15",
+    "url": "https://github.com/Lukas6623/ServerGuard/releases/download/v1.1.15/ServerGuard-v1.1.15.zip",
+    "sha256": "77D15275C178BD3113725D787E7370E9108A54B85165F5BE9E8F54F47E1EAB3A",
 
     "installer_version": "0.0.6",
     "installer_url": "https://github.com/Lukas6623/ServerGuardCode/releases/download/V.0.0.6/ServerGuardSetup.exe",
