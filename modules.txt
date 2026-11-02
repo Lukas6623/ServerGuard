@@ -1,1 +1,0 @@
-brute_force_guard|1.0.0|https://raw.githubusercontent.com/Lukas6623/ServerGuard/main/brute_force_guard.py
